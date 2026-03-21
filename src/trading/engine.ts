@@ -386,7 +386,8 @@ export class TradingEngine {
         });
 
         console.log(`[Strategist] Qwen3.5 responded in ${strategistResult.inferenceMs}ms, cost: $${strategistResult.estimatedCost.toFixed(4)}`);
-        console.log(`[Strategist] Raw text: ${strategistResult.text?.slice(0, 300)}`);
+        console.log(`[Strategist] Content length: ${strategistResult.text?.length}, first 200: ${strategistResult.text?.slice(0, 200)}`);
+        console.log(`[Strategist] Thinking length: ${strategistResult.thinkingText?.length}`);
 
         // Parse strategist decision
         const decision = extractJson(strategistResult.text) as {
@@ -401,6 +402,8 @@ export class TradingEngine {
           risk_score?: number;  // snake_case variant
           risk?: number;        // short variant
         } | null;
+
+        console.log(`[Strategist] Parsed decision: ${JSON.stringify(decision)?.slice(0, 300)}`);
 
         // Normalize field names (Qwen3.5 sometimes uses different casing/names)
         if (decision) {

@@ -267,9 +267,11 @@ export async function callWaveSpeed(
  * Uses Zod schema for type-safe validation.
  */
 export function extractJson<T>(text: string, schema?: ZodSchema<T>): T | null {
-  // Try full response as JSON first
+  if (!text || typeof text !== 'string') return null;
+
+  // Try full response as JSON first (trim whitespace)
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(text.trim());
     if (schema) {
       const result = schema.safeParse(parsed);
       return result.success ? result.data : null;
@@ -279,7 +281,23 @@ export function extractJson<T>(text: string, schema?: ZodSchema<T>): T | null {
     // Fall through to regex extraction
   }
 
-  // Extract last JSON object from text
+  // Extract JSON object from text (supports multi-line and nested)
+  const jsonStart = text.indexOf('{');
+  const jsonEnd = text.lastIndexOf('}');
+  if (jsonStart !== -1 && jsonEnd > jsonStart) {
+    try {
+      const parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
+      if (schema) {
+        const result = schema.safeParse(parsed);
+        return result.success ? result.data : null;
+      }
+      return parsed as T;
+    } catch {
+      // Fall through
+    }
+  }
+
+  // Fallback: try simple non-nested regex
   const matches = text.match(/\{[^{}]*\}/g);
   if (!matches) return null;
 
