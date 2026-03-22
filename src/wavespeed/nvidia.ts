@@ -31,28 +31,37 @@ export async function callQwenStrategist(
 ): Promise<NvidiaResponse> {
   const start = Date.now();
 
-  const response = await fetch(NVIDIA_API_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'qwen/qwen3.5-122b-a10b',
-      messages: [
-        { role: 'system', content: opts.systemPrompt },
-        { role: 'user', content: opts.prompt },
-      ],
-      max_tokens: opts.maxTokens ?? 8192,
-      temperature: opts.temperature ?? 0.6,
-      top_p: 0.95,
-      stream: false,
-      chat_template_kwargs: {
-        enable_thinking: opts.enableThinking ?? true,
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000); // 25s timeout
+
+  let response: Response;
+  try {
+    response = await fetch(NVIDIA_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
       },
-    }),
-  });
+      body: JSON.stringify({
+        model: 'qwen/qwen3.5-122b-a10b',
+        messages: [
+          { role: 'system', content: opts.systemPrompt },
+          { role: 'user', content: opts.prompt },
+        ],
+        max_tokens: opts.maxTokens ?? 8192,
+        temperature: opts.temperature ?? 0.6,
+        top_p: 0.95,
+        stream: false,
+        chat_template_kwargs: {
+          enable_thinking: opts.enableThinking ?? true,
+        },
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const inferenceMs = Date.now() - start;
 

@@ -431,10 +431,10 @@ export class TradingEngine {
 
         const strategistResult = await callQwenStrategist(this.nvidiaKey, {
           prompt: strategistPrompt,
-          systemPrompt: `You are an expert crypto trading strategist. Analyze the trade setup and decide whether to execute. Be conservative - only approve trades with clear edge. IMPORTANT: Your response MUST be a JSON object with these fields: {"execute": true/false, "reasoning": "1-2 sentences why", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. Keep thinking brief.`,
+          systemPrompt: `You are an expert crypto trading strategist. Analyze the trade setup and decide whether to execute. Be conservative - only approve trades with clear edge. Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sentences", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. No other text.`,
           temperature: 0.3,
-          maxTokens: 4096,
-          enableThinking: true,
+          maxTokens: 512,
+          enableThinking: false,
         });
 
         console.log(`[Strategist] Qwen3.5 responded in ${strategistResult.inferenceMs}ms, cost: $${strategistResult.estimatedCost.toFixed(4)}`);
