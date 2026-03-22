@@ -31,13 +31,23 @@ export class HyperliquidClient implements IExchange {
   private loaded = false;
 
   constructor(env: HyperliquidEnv) {
-    this.privateKey = env.privateKey.startsWith('0x') ? env.privateKey.slice(2) : env.privateKey;
+    // Clean up private key — remove 0x prefix, trim whitespace/newlines
+    let pk = env.privateKey.trim();
+    if (pk.startsWith('0x')) pk = pk.slice(2);
+    pk = pk.replace(/[\s\n\r]/g, '');
+
+    if (pk.length !== 64 || !/^[0-9a-fA-F]+$/.test(pk)) {
+      throw new Error(`Invalid private key: expected 64 hex chars, got ${pk.length} chars`);
+    }
+
+    this.privateKey = pk;
     this.address = privateKeyToAddress(this.privateKey);
     this.vaultAddress = env.vaultAddress;
     this.isTestnet = env.isTestnet;
     this.baseUrl = env.isTestnet
       ? 'https://api.hyperliquid-testnet.xyz'
       : 'https://api.hyperliquid.xyz';
+    console.log(`[Hyperliquid] Initialized for ${this.address} (${env.isTestnet ? 'testnet' : 'mainnet'})`);
   }
 
   // --- Helpers ---
