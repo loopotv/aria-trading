@@ -121,6 +121,23 @@ export class TelegramBot {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, allowed_updates: ['message'] }),
     });
+
+    // Register bot commands menu
+    await fetch(`https://api.telegram.org/bot${this.token}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        commands: [
+          { command: 'status', description: 'Account balance & status' },
+          { command: 'pos', description: 'Open positions with SL/TP' },
+          { command: 'perf', description: 'Performance report' },
+          { command: 'audit', description: 'System health check' },
+          { command: 'costs', description: 'LLM costs & net P&L' },
+          { command: 'exp', description: 'Experience database stats' },
+          { command: 'help', description: 'All commands' },
+        ],
+      }),
+    });
   }
 
   async handleUpdate(update: TelegramUpdate, chatId: string): Promise<string | null> {
