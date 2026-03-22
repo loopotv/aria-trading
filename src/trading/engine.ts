@@ -51,6 +51,11 @@ interface SoftOrder {
 // Persisted across cron invocations via module-level variable (same isolate)
 const softOrders: Map<string, SoftOrder> = new Map();
 
+/** Get current soft order keys for audit */
+export function getSoftOrderKeys(): string[] {
+  return [...softOrders.keys()];
+}
+
 export class TradingEngine {
   private binance: BinanceFuturesClient;
   private telegram: TelegramBot;

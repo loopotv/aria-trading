@@ -9,7 +9,8 @@
 import { Hono } from 'hono';
 import { BinanceFuturesClient } from './binance/client';
 import { TelegramBot, TelegramUpdate } from './telegram/bot';
-import { TradingEngine, EngineConfig } from './trading/engine';
+import { TradingEngine, EngineConfig, getSoftOrderKeys } from './trading/engine';
+import { runAudit, formatAuditTelegram, formatAuditAlert } from './trading/audit';
 import { generateReport, formatReportTelegram, formatReportCompact, TradeRecord } from './trading/performance';
 import { costTracker, loadCosts, flushCosts, formatCostsTelegram } from './wavespeed/client';
 import type { AiBinding } from './wavespeed/workers-ai';
@@ -294,6 +295,23 @@ app.post('/webhook/telegram/:secret', async (c) => {
         break;
       }
 
+      case '/audit': {
+        const binance = new BinanceFuturesClient({
+          BINANCE_API_KEY: c.env.BINANCE_API_KEY,
+          BINANCE_API_SECRET: c.env.BINANCE_API_SECRET,
+          ENVIRONMENT: c.env.ENVIRONMENT,
+        });
+        await binance.loadExchangeInfo();
+        if (!c.env.DB) {
+          await telegram.sendMessage('⚠️ D1 not configured.');
+          break;
+        }
+        const expDb = new ExperienceDB(c.env.DB);
+        const report = await runAudit(binance, expDb, getSoftOrderKeys(), 5000);
+        await telegram.sendMessage(formatAuditTelegram(report));
+        break;
+      }
+
       case '/closeold': {
         // One-time command: close old positions without SL/TP and clean D1
         const binance = new BinanceFuturesClient({
@@ -368,6 +386,7 @@ app.post('/webhook/telegram/:secret', async (c) => {
           `/perf - Performance report\n` +
           `/costs - Costi LLM & P&L netto\n` +
           `/exp - Experience database stats\n` +
+          `/audit - System health check\n` +
           `/stop - Stop info\n` +
           `/help - This message`;
         await telegram.sendMessage(msg);
@@ -492,6 +511,27 @@ export default {
           console.log(`[Costs] Flushed: ${costTracker.totalCalls} calls, $${costTracker.totalCostUsd.toFixed(4)}`);
         } catch (e) {
           console.error(`[Costs] Flush failed:`, (e as Error).message);
+        }
+      }
+
+      // 5. Auto audit — alert only on critical/warning issues
+      if (env.DB) {
+        try {
+          const auditBinance = new BinanceFuturesClient({
+            BINANCE_API_KEY: env.BINANCE_API_KEY,
+            BINANCE_API_SECRET: env.BINANCE_API_SECRET,
+            ENVIRONMENT: env.ENVIRONMENT,
+          });
+          const auditExp = new ExperienceDB(env.DB);
+          const auditReport = await runAudit(auditBinance, auditExp, getSoftOrderKeys(), 5000);
+          const alert = formatAuditAlert(auditReport.issues);
+          if (alert) {
+            const auditTelegram = new TelegramBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
+            await auditTelegram.sendMessage(alert);
+          }
+          console.log(`[Audit] ${auditReport.issues.length} issues (${auditReport.issues.filter(i => i.severity === 'CRITICAL').length} critical)`);
+        } catch (e) {
+          console.error(`[Audit] Failed:`, (e as Error).message);
         }
       }
     }
