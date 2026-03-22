@@ -133,9 +133,18 @@ app.post('/webhook/telegram/:secret', async (c) => {
         }
 
         // Load open trades from D1 for SL/TP/leverage data
+        // Use most recent trade per symbol:direction (has best data after fixes)
         const experience = c.env.DB ? new ExperienceDB(c.env.DB) : null;
         const openTrades = experience ? await experience.getOpenTrades() : [];
-        const tradeMap = new Map(openTrades.map(t => [`${t.symbol}:${t.direction}`, t]));
+        const tradeMap = new Map<string, (typeof openTrades)[number]>();
+        for (const t of openTrades) {
+          const key = `${t.symbol}:${t.direction}`;
+          const existing = tradeMap.get(key);
+          // Prefer trade with SL/TP, or most recent
+          if (!existing || (t.stop_loss && !existing.stop_loss)) {
+            tradeMap.set(key, t);
+          }
+        }
 
         let totalPnl = 0;
         let msg = `📊 <b>Open Positions (${positions.length})</b>\n\n`;
