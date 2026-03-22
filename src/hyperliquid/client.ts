@@ -29,6 +29,9 @@ export class HyperliquidClient implements IExchange {
   // Asset mapping
   private assetIndex: Map<string, number> = new Map(); // BTC -> 0, ETH -> 1
   private assetInfo: Map<string, { szDecimals: number; maxLeverage: number }> = new Map();
+  // Cache clearinghouseState to avoid redundant API calls (HL rate limits aggressively)
+  private cachedState: HlClearinghouseState | null = null;
+  private cachedStateTs = 0;
   private symbolPrecisionCache: Map<string, SymbolPrecision> = new Map();
   private loaded = false;
 
@@ -72,6 +75,20 @@ export class HyperliquidClient implements IExchange {
     return idx;
   }
 
+  /** Get clearinghouse state with 30s cache */
+  private async getClearinghouseState(): Promise<HlClearinghouseState> {
+    const now = Date.now();
+    if (this.cachedState && now - this.cachedStateTs < 30_000) {
+      return this.cachedState;
+    }
+    this.cachedState = await this.infoPost<HlClearinghouseState>({
+      type: 'clearinghouseState',
+      user: this.userAddress,
+    });
+    this.cachedStateTs = now;
+    return this.cachedState;
+  }
+
   private async infoPost<T>(body: any): Promise<T> {
     const res = await fetch(`${this.baseUrl}/info`, {
       method: 'POST',
@@ -80,6 +97,12 @@ export class HyperliquidClient implements IExchange {
     });
     if (!res.ok) throw new Error(`HL info ${res.status}: ${(await res.text()).slice(0, 200)}`);
     return res.json() as Promise<T>;
+  }
+
+  /** Invalidate cache after trades change state */
+  private invalidateCache(): void {
+    this.cachedState = null;
+    this.cachedStateTs = 0;
   }
 
   private async exchangePost(action: any): Promise<any> {
@@ -216,10 +239,7 @@ export class HyperliquidClient implements IExchange {
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
-    const state = await this.infoPost<HlClearinghouseState>({
-      type: 'clearinghouseState',
-      user: this.userAddress,
-    });
+    const state = await this.getClearinghouseState();
 
     // Always fetch both perps and spot balance (unified account support)
     let walletBalance = parseFloat(state.marginSummary.accountValue || '0');
@@ -267,10 +287,7 @@ export class HyperliquidClient implements IExchange {
   }
 
   async getPositionRisk(): Promise<PositionRiskEntry[]> {
-    const state = await this.infoPost<HlClearinghouseState>({
-      type: 'clearinghouseState',
-      user: this.userAddress,
-    });
+    const state = await this.getClearinghouseState();
 
     return state.assetPositions
       .filter(p => parseFloat(p.position.szi) !== 0)
@@ -351,6 +368,7 @@ export class HyperliquidClient implements IExchange {
     const status = result.response?.data?.statuses?.[0];
     if (status?.error) throw new Error(`HL order error: ${status.error}`);
 
+    this.invalidateCache();
     return {
       orderId: status?.resting?.oid || status?.filled?.oid || 0,
       status: status?.filled ? 'FILLED' : 'NEW',
