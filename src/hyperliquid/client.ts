@@ -221,6 +221,22 @@ export class HyperliquidClient implements IExchange {
       user: this.userAddress,
     });
 
+    // Unified account: perps balance may be 0, check spot balance too
+    let walletBalance = parseFloat(state.marginSummary.accountValue);
+    let availableBalance = parseFloat(state.withdrawable);
+
+    if (walletBalance === 0) {
+      const spotState = await this.infoPost<{ balances: Array<{ coin: string; total: string }> }>({
+        type: 'spotClearinghouseState',
+        user: this.userAddress,
+      });
+      const usdcBalance = spotState.balances?.find(b => b.coin === 'USDC');
+      if (usdcBalance) {
+        walletBalance = parseFloat(usdcBalance.total);
+        availableBalance = walletBalance;
+      }
+    }
+
     const totalUnrealized = state.assetPositions.reduce(
       (sum, p) => sum + parseFloat(p.position.unrealizedPnl || '0'), 0
     );
@@ -238,10 +254,10 @@ export class HyperliquidClient implements IExchange {
     });
 
     return {
-      totalWalletBalance: state.marginSummary.accountValue,
+      totalWalletBalance: walletBalance.toString(),
       totalUnrealizedProfit: totalUnrealized.toString(),
-      totalMarginBalance: state.marginSummary.accountValue,
-      availableBalance: state.withdrawable,
+      totalMarginBalance: walletBalance.toString(),
+      availableBalance: availableBalance.toString(),
       positions,
     };
   }
