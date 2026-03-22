@@ -10,6 +10,7 @@ crons = ["*/5 * * * *"]
 ENVIRONMENT = "testnet"
 BOT_ACTIVE = "true"
 EXCHANGE = "hyperliquid"
+HL_WALLET_ADDRESS = "0xA617CAfCC46DE8852E16F06a93b39c694d18003C"
 
 # KV namespace for persistent cost tracking
 [[kv_namespaces]]
