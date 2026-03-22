@@ -120,12 +120,23 @@ export class TradingEngine {
     await this.binance.loadExchangeInfo();
 
     try {
-      // 1. Collect events (on stateless Worker, always process fresh)
-      const { newItems, fearGreed } = await collectEvents(
+      // 1. Collect events (seenIds only works within same isolate)
+      const { newItems: rawItems, fearGreed } = await collectEvents(
         this.seenIds,
         60 * 60 * 1000 // 1 hour lookback
       );
       this.lastFearGreed = fearGreed.value;
+
+      // 2. Deduplicate against D1 (persists across Worker restarts/deploys)
+      let newItems = rawItems;
+      if (this.experience && rawItems.length > 0) {
+        const seenTitles = await this.experience.getRecentNewsTitles(2);
+        const before = newItems.length;
+        newItems = rawItems.filter(item => !seenTitles.has(item.text));
+        const deduped = before - newItems.length;
+        if (deduped > 0) console.log(`[Engine] Deduped ${deduped} news already in D1`);
+      }
+
       console.log(`[Engine] Collected ${newItems.length} new items, F&G: ${fearGreed.value}`);
 
       // Detect market regime
@@ -173,6 +184,22 @@ export class TradingEngine {
       }
 
       console.log(`[Engine] High impact: ${highImpact.length}, Normal: ${normalItems.length}`);
+
+      // Record all news items in D1 for deduplication and tracking
+      if (this.experience) {
+        for (const item of newItems) {
+          try {
+            await this.experience.recordNewsEvent({
+              source: item.source,
+              title: item.text,
+              body: item.text.slice(0, 500),
+              asset: item.relatedAssets?.[0],
+              impactLevel: classifyImpact(item) === 'high' ? 'HIGH' : 'NORMAL',
+              publishedAt: new Date(item.publishedAt).toISOString(),
+            });
+          } catch { /* ignore duplicate errors */ }
+        }
+      }
 
       // 3. Event-Driven: process high-impact items with Sonnet 4.5
       if (this.config.enableEventDriven && highImpact.length > 0) {

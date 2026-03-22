@@ -120,6 +120,18 @@ export class ExperienceDB {
 
   // ---- NEWS EVENTS ----
 
+  /** Get recent news titles for deduplication across Worker restarts */
+  async getRecentNewsTitles(hoursBack: number = 2): Promise<Set<string>> {
+    const result = await this.db
+      .prepare(
+        `SELECT title FROM news_events
+        WHERE processed_at > datetime('now', '-' || ? || ' hours')`
+      )
+      .bind(hoursBack)
+      .all<{ title: string }>();
+    return new Set((result.results || []).map(r => r.title));
+  }
+
   async recordNewsEvent(event: NewsEventRecord): Promise<number> {
     await this.db
       .prepare(
