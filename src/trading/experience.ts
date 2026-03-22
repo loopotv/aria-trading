@@ -570,4 +570,39 @@ export class ExperienceDB {
       }>();
     return result.results || [];
   }
+
+  /** Get all trades for performance report */
+  async getAllTrades(): Promise<Array<{
+    id: number;
+    symbol: string;
+    direction: string;
+    price: number;
+    quantity: number;
+    pnl: number | null;
+    status: string;
+    leverage: number;
+    strategy: string;
+    opened_at: string;
+    closed_at: string | null;
+  }>> {
+    const result = await this.db
+      .prepare(
+        `SELECT id, symbol, direction, price, quantity, pnl, status, leverage, strategy, opened_at, closed_at
+        FROM trades ORDER BY opened_at ASC`
+      )
+      .all<{
+        id: number;
+        symbol: string;
+        direction: string;
+        price: number;
+        quantity: number;
+        pnl: number | null;
+        status: string;
+        leverage: number;
+        strategy: string;
+        opened_at: string;
+        closed_at: string | null;
+      }>();
+    return result.results || [];
+  }
 }

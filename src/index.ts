@@ -205,50 +205,62 @@ app.post('/webhook/telegram/:secret', async (c) => {
           (p: any) => parseFloat(p.positionAmt) !== 0
         );
 
-        // Fetch real trade history from Binance
-        const rawTrades = await binance.getAllUserTrades(200);
+        // Build trade list from D1 (primary) + Binance fills for fee data
+        const expDb = c.env.DB ? new ExperienceDB(c.env.DB) : null;
 
-        // Group trades by symbol+side to reconstruct open/close pairs
-        // Each Binance "trade" is a fill - we need to pair opens with closes
-        const tradesBySymbolSide = new Map<string, any[]>();
-        for (const t of rawTrades) {
-          const key = `${t.symbol}:${t.positionSide || (t.side === 'BUY' ? 'LONG' : 'SHORT')}`;
-          const list = tradesBySymbolSide.get(key) || [];
-          list.push(t);
-          tradesBySymbolSide.set(key, list);
+        // Get all traded symbols from D1 to ensure we fetch their Binance fills too
+        const allDbTrades = expDb ? await expDb.getAllTrades() : [];
+        const dbSymbols = new Set(allDbTrades.map(t => t.symbol));
+
+        // Fetch fills from Binance for all known symbols
+        const activeSymbols = new Set<string>();
+        for (const p of positions) {
+          if (parseFloat((p as any).positionAmt || '0') !== 0) activeSymbols.add((p as any).symbol);
+        }
+        for (const s of dbSymbols) activeSymbols.add(s);
+        // Common symbols as fallback
+        for (const s of ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']) activeSymbols.add(s);
+
+        let totalFeesBySymbol = new Map<string, number>();
+        for (const sym of activeSymbols) {
+          try {
+            const fills = await binance.getUserTrades(sym, 500);
+            const fee = fills.reduce((sum: number, f: any) => sum + parseFloat(f.commission || '0'), 0);
+            totalFeesBySymbol.set(sym, fee);
+          } catch { /* symbol might not have trades */ }
         }
 
-        const trades: TradeRecord[] = [];
-        for (const [key, fills] of tradesBySymbolSide) {
-          const [symbol, side] = key.split(':');
-          const direction = (side === 'LONG' ? 'LONG' : 'SHORT') as 'LONG' | 'SHORT';
-          const totalPnl = fills.reduce((sum: number, f: any) => sum + parseFloat(f.realizedPnl || '0'), 0);
-          const totalFee = fills.reduce((sum: number, f: any) => sum + parseFloat(f.commission || '0'), 0);
-          const firstFill = fills[0];
-          const lastFill = fills[fills.length - 1];
-
-          // Check if position is still open
-          const isOpen = positions.some((p: any) => {
-            const amt = parseFloat(p.positionAmt);
-            const pSide = amt > 0 ? 'LONG' : 'SHORT';
-            return p.symbol === symbol && pSide === side && amt !== 0;
-          });
-
-          trades.push({
-            id: `${symbol}-${side}-${firstFill.id}`,
-            symbol,
-            direction,
-            entryPrice: parseFloat(firstFill.price),
-            exitPrice: isOpen ? undefined : parseFloat(lastFill.price),
-            quantity: Math.abs(parseFloat(firstFill.qty)),
-            leverage: 3,
-            strategy: 'live',
-            pnl: isOpen ? undefined : totalPnl,
-            fee: totalFee,
+        // Build TradeRecords from D1 (individual trades, not grouped fills)
+        const trades: TradeRecord[] = allDbTrades.map(t => {
+          const isOpen = t.status === 'OPEN';
+          return {
+            id: `${t.symbol}-${t.direction}-${t.id}`,
+            symbol: t.symbol,
+            direction: t.direction as 'LONG' | 'SHORT',
+            entryPrice: t.price,
+            exitPrice: isOpen ? undefined : t.price, // approx
+            quantity: t.quantity,
+            leverage: t.leverage || 3,
+            strategy: t.strategy || 'live',
+            pnl: isOpen ? undefined : (t.pnl || 0),
+            fee: 0, // fees tracked at symbol level
             status: isOpen ? 'OPEN' : 'CLOSED',
-            openedAt: firstFill.time,
-            closedAt: isOpen ? undefined : lastFill.time,
-          });
+            openedAt: new Date(t.opened_at).getTime(),
+            closedAt: t.closed_at ? new Date(t.closed_at).getTime() : undefined,
+          };
+        });
+
+        // Distribute fees proportionally across trades per symbol
+        const tradesBySymbol = new Map<string, TradeRecord[]>();
+        for (const t of trades) {
+          const list = tradesBySymbol.get(t.symbol) || [];
+          list.push(t);
+          tradesBySymbol.set(t.symbol, list);
+        }
+        for (const [sym, symTrades] of tradesBySymbol) {
+          const totalFee = totalFeesBySymbol.get(sym) || 0;
+          const perTrade = symTrades.length > 0 ? totalFee / symTrades.length : 0;
+          for (const t of symTrades) t.fee = perTrade;
         }
 
         const startingBalance = 5000;
