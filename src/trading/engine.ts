@@ -9,6 +9,7 @@
  */
 
 import { BinanceFuturesClient } from '../binance/client';
+import type { AccountInfo } from '../binance/types';
 import { TelegramBot } from '../telegram/bot';
 import { collectEvents, classifyImpact } from '../ingestion/collector';
 import { processHighImpactItem, processBatch } from '../sentiment/llm-sensor';
@@ -66,6 +67,9 @@ export class TradingEngine {
   private firstRun = true;
   private experience?: ExperienceDB;
   private nvidiaKey?: string;
+  // Cache account info per cycle to avoid redundant API calls (Binance rate limits)
+  private cachedAccount: AccountInfo | null = null;
+  private cachedAccountTs = 0;
 
   constructor(
     binance: BinanceFuturesClient,
@@ -83,6 +87,23 @@ export class TradingEngine {
     this.ai = ai;
     if (db) this.experience = new ExperienceDB(db);
     this.nvidiaKey = nvidiaKey;
+  }
+
+  /** Get account info with 30s cache to avoid redundant API calls */
+  private async getAccount(forceRefresh = false): Promise<AccountInfo> {
+    const now = Date.now();
+    if (!forceRefresh && this.cachedAccount && now - this.cachedAccountTs < 30_000) {
+      return this.cachedAccount;
+    }
+    this.cachedAccount = await this.binance.getAccountInfo();
+    this.cachedAccountTs = now;
+    return this.cachedAccount;
+  }
+
+  /** Invalidate account cache after a trade changes balances/positions */
+  private invalidateAccountCache(): void {
+    this.cachedAccount = null;
+    this.cachedAccountTs = 0;
   }
 
   /**
@@ -243,7 +264,7 @@ export class TradingEngine {
 
     try {
       // Get current account state
-      const account = await this.binance.getAccountInfo();
+      const account = await this.getAccount();
       const balance = parseFloat(account.availableBalance);
 
       // Build sentiment snapshots per asset
@@ -389,8 +410,8 @@ export class TradingEngine {
         console.log(`[Strategist] Content length: ${strategistResult.text?.length}, first 200: ${strategistResult.text?.slice(0, 200)}`);
         console.log(`[Strategist] Thinking length: ${strategistResult.thinkingText?.length}`);
 
-        // Parse strategist decision
-        const decision = extractJson(strategistResult.text) as {
+        // Parse strategist decision - try content first, fallback to thinking
+        type StrategistDecision = {
           execute?: boolean;
           reasoning?: string;
           reason?: string;      // Qwen sometimes uses "reason" instead of "reasoning"
@@ -401,7 +422,12 @@ export class TradingEngine {
           riskScore?: number;
           risk_score?: number;  // snake_case variant
           risk?: number;        // short variant
-        } | null;
+        };
+        let decision = extractJson(strategistResult.text) as StrategistDecision | null;
+        if (!decision && strategistResult.thinkingText) {
+          console.log(`[Strategist] No JSON in content, trying thinking text...`);
+          decision = extractJson(strategistResult.thinkingText) as StrategistDecision | null;
+        }
 
         console.log(`[Strategist] Parsed decision: ${JSON.stringify(decision)?.slice(0, 300)}`);
 
@@ -456,7 +482,7 @@ export class TradingEngine {
     }
 
     // Check position limits
-    const account = await this.binance.getAccountInfo();
+    const account = await this.getAccount();
     const openCount = account.positions.filter(
       (p: any) => parseFloat(p.positionAmt) !== 0
     ).length;
@@ -468,7 +494,7 @@ export class TradingEngine {
 
     // Execute trade
     const balance = parseFloat(account.availableBalance);
-    await this.executeTrade(symbol, setup.direction, currentPrice, setup.stopLoss, setup.takeProfit, balance, 'event-driven');
+    await this.executeTrade(symbol, setup.direction, currentPrice, setup.stopLoss, setup.takeProfit, balance, 'event-driven', signal);
   }
 
   /**
@@ -488,7 +514,7 @@ export class TradingEngine {
     }
 
     // Check if already have position on this symbol
-    const account = await this.binance.getAccountInfo();
+    const account = await this.getAccount();
     const hasPosition = account.positions.some(
       (p: any) => p.symbol === symbol && parseFloat(p.positionAmt) !== 0
     );
@@ -512,7 +538,18 @@ export class TradingEngine {
       return;
     }
 
-    await this.executeTrade(symbol, direction, currentPrice, filter.stopLoss, filter.takeProfit, balance, 'market-neutral');
+    // Build a minimal signal from the snapshot for experience DB
+    const syntheticSignal: SentimentSignal = {
+      asset: snap.asset,
+      sentimentScore: snap.compositeScore,
+      confidence: snap.avgConfidence,
+      magnitude: snap.avgMagnitude,
+      direction: snap.compositeScore > 0 ? 'positive' : 'negative',
+      source: 'aggregated',
+      category: 'market-neutral',
+      timestamp: snap.timestamp,
+    };
+    await this.executeTrade(symbol, direction, currentPrice, filter.stopLoss, filter.takeProfit, balance, 'market-neutral', syntheticSignal);
   }
 
   /**
@@ -526,7 +563,8 @@ export class TradingEngine {
     stopLoss: number,
     takeProfit: number,
     balance: number,
-    strategy: string
+    strategy: string,
+    signal?: SentimentSignal
   ): Promise<void> {
     try {
       // Dynamic parameters based on market regime
@@ -542,7 +580,7 @@ export class TradingEngine {
         : this.config.maxPositions;
 
       // Check position limit (regime-aware)
-      const account2 = await this.binance.getAccountInfo();
+      const account2 = await this.getAccount();
       const currentOpenCount = account2.positions.filter(
         (p: any) => parseFloat(p.positionAmt) !== 0
       ).length;
@@ -578,8 +616,14 @@ export class TradingEngine {
       const roundedTP = this.binance.roundPrice(symbol, takeProfit);
       const side = direction === 'LONG' ? 'BUY' : 'SELL';
 
-      // Check minimum notional
+      // Clamp to max quantity allowed by Binance
       const info = this.binance.getSymbolPrecision(symbol);
+      if (info && quantity > info.maxQty) {
+        console.log(`[Trade] ${symbol} qty ${quantity} exceeds maxQty ${info.maxQty}, clamping`);
+        quantity = info.maxQty;
+      }
+
+      // Check minimum notional
       if (info && quantity * price < info.minNotional) {
         console.log(`[Trade] ${symbol} notional $${(quantity * price).toFixed(2)} below min $${info.minNotional}, skipping`);
         return;
@@ -605,6 +649,7 @@ export class TradingEngine {
       });
 
       console.log(`[Trade] Order filled: ${(order as any).orderId}`);
+      this.invalidateAccountCache();
 
       // Notify Telegram
       await this.telegram.notifyTradeOpen({
@@ -708,7 +753,7 @@ export class TradingEngine {
 
     console.log(`[SoftSL/TP] Checking ${softOrders.size} orders...`);
 
-    const account = await this.binance.getAccountInfo();
+    const account = await this.getAccount();
     const openPositions = account.positions.filter(
       (p: any) => parseFloat(p.positionAmt) !== 0
     );
@@ -764,6 +809,7 @@ export class TradingEngine {
           });
 
           console.log(`[SoftSL/TP] CLOSED ${order.symbol} ${order.direction}: ${reason} | P&L: $${pnl.toFixed(2)}`);
+          this.invalidateAccountCache();
 
           // Record close in experience DB
           if (this.experience) {

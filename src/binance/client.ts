@@ -18,6 +18,7 @@ interface SymbolPrecision {
   stepSize: number;
   tickSize: number;
   minQty: number;
+  maxQty: number;
   minNotional: number;
 }
 
@@ -70,6 +71,7 @@ export class BinanceFuturesClient {
           stepSize: parseFloat(lotFilter?.stepSize || '0.01'),
           tickSize: parseFloat(priceFilter?.tickSize || '0.01'),
           minQty: parseFloat(lotFilter?.minQty || '0.001'),
+          maxQty: parseFloat(lotFilter?.maxQty || '1000000'),
           minNotional: parseFloat(minNotionalFilter?.notional || '5'),
         });
       }
