@@ -25,6 +25,7 @@ export interface PerformanceReport {
   avgLoss: number;
   largestWin: number;
   largestLoss: number;
+  breakeven: number;
   profitFactor: number;
 
   // Risk metrics
@@ -90,14 +91,16 @@ export function generateReport(
   const totalPnl = realizedPnl + unrealizedPnl;
   const netPnl = totalPnl - totalFees;
 
-  // Win / loss
+  // Win / loss (pnl === 0 = breakeven, not counted as win or loss)
   const wins = closed.filter((t) => (t.pnl ?? 0) > 0);
   const losses = closed.filter((t) => (t.pnl ?? 0) < 0);
+  const breakeven = closed.length - wins.length - losses.length;
 
   const grossWins = wins.reduce((s, t) => s + (t.pnl ?? 0), 0);
   const grossLosses = Math.abs(losses.reduce((s, t) => s + (t.pnl ?? 0), 0));
 
-  const winRate = closed.length > 0 ? wins.length / closed.length : 0;
+  const decidedTrades = wins.length + losses.length;
+  const winRate = decidedTrades > 0 ? wins.length / decidedTrades : 0;
   const avgWin = wins.length > 0 ? grossWins / wins.length : 0;
   const avgLoss = losses.length > 0 ? grossLosses / losses.length : 0;
   const largestWin = wins.length > 0 ? Math.max(...wins.map((t) => t.pnl ?? 0)) : 0;
@@ -183,6 +186,7 @@ export function generateReport(
     avgLoss,
     largestWin,
     largestLoss,
+    breakeven,
     profitFactor,
     sharpeRatio,
     maxDrawdown,
@@ -287,7 +291,7 @@ export function formatReportTelegram(report: PerformanceReport): string {
   // Win / Loss
   msg += `\u{1F3AF} <b>Win/Loss</b>\n`;
   msg += `  Trades: ${report.closedTrades} closed, ${report.openTrades} open\n`;
-  msg += `  Win Rate: ${(report.winRate * 100).toFixed(1)}% (${report.wins}W / ${report.losses}L)\n`;
+  msg += `  Win Rate: ${(report.winRate * 100).toFixed(1)}% (${report.wins}W / ${report.losses}L${report.breakeven > 0 ? ` / ${report.breakeven}BE` : ''})\n`;
   msg += `  Avg Win: $${report.avgWin.toFixed(2)} | Avg Loss: $${report.avgLoss.toFixed(2)}\n`;
   msg += `  Best: ${fmtPnl(report.largestWin)} | Worst: ${fmtPnl(report.largestLoss)}\n`;
   msg += `  Profit Factor: ${report.profitFactor === Infinity ? '\u{221E}' : report.profitFactor.toFixed(2)}\n\n`;

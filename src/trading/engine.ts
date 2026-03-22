@@ -801,6 +801,15 @@ export class TradingEngine {
 
       if (!pos) {
         // Position was closed (by Binance algo order or rebalance)
+        // Record close in D1 with pnl=0 (actual pnl unknown since position is gone)
+        if (this.experience) {
+          try {
+            await this.experience.recordTradeClose(order.symbol, order.direction, order.entryPrice, 0);
+            console.log(`[SoftSL/TP] Recorded external close: ${order.symbol} ${order.direction}`);
+          } catch (e) {
+            console.warn(`[SoftSL/TP] Failed to record close: ${(e as Error).message?.slice(0, 80)}`);
+          }
+        }
         softOrders.delete(key);
         continue;
       }
