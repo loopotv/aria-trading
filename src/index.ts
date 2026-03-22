@@ -121,13 +121,14 @@ app.post('/webhook/telegram/:secret', async (c) => {
         const positions = account.positions.filter(
           (p: any) => parseFloat(p.positionAmt) !== 0
         );
+        const exchangeName = (c.env.EXCHANGE || 'binance').toUpperCase();
         const msg =
           `🤖 <b>Bot Status</b>\n\n` +
+          `<b>Exchange:</b> <code>${exchangeName}</code>\n` +
           `<b>Balance:</b> <code>$${parseFloat(account.totalWalletBalance).toFixed(2)}</code>\n` +
           `<b>Unrealized:</b> <code>$${parseFloat(account.totalUnrealizedProfit).toFixed(2)}</code>\n` +
           `<b>Available:</b> <code>$${parseFloat(account.availableBalance).toFixed(2)}</code>\n` +
           `<b>Positions:</b> ${positions.length}\n` +
-          `<b>Environment:</b> <code>${c.env.ENVIRONMENT}</code>\n` +
           `<b>Bot Active:</b> ${c.env.BOT_ACTIVE === 'true' ? '✅' : '❌'}`;
         await telegram.sendMessage(msg);
         break;
@@ -434,7 +435,11 @@ function getEngine(env: Bindings): TradingEngine {
 
     const isHyperliquid = (env.EXCHANGE || 'binance').toLowerCase() === 'hyperliquid';
     const config: EngineConfig = {
-      symbols: [
+      symbols: isHyperliquid ? [
+        'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'HYPEUSDT',
+        'BNBUSDT', 'DOGEUSDT', 'SUIUSDT', 'AVAXUSDT', 'LINKUSDT',
+        'ARBUSDT', 'OPUSDT', 'NEARUSDT', 'AAVEUSDT',
+      ] : [
         'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
         'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
       ],

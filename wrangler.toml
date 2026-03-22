@@ -7,7 +7,7 @@ compatibility_date = "2026-03-01"
 crons = ["*/5 * * * *"]
 
 [vars]
-ENVIRONMENT = "testnet"
+ENVIRONMENT = "mainnet"
 BOT_ACTIVE = "true"
 EXCHANGE = "hyperliquid"
 HL_WALLET_ADDRESS = "0xA617CAfCC46DE8852E16F06a93b39c694d18003C"
