@@ -257,7 +257,15 @@ export function formatReportTelegram(report: PerformanceReport): string {
 
   let msg = '';
   msg += `\u{1F4CA} <b>Performance Report</b>\n`;
-  msg += `\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n`;
+  msg += `\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n`;
+
+  // Timeframe
+  if (report.dailyPnl.length > 0) {
+    const firstDate = report.dailyPnl[0].date;
+    const lastDate = report.dailyPnl[report.dailyPnl.length - 1].date;
+    msg += `\u{1F4C6} <i>${firstDate} → ${lastDate} (${report.tradingDays}d)</i>\n`;
+  }
+  msg += '\n';
 
   // Balance
   const equity = report.currentBalance + report.unrealizedPnl;
