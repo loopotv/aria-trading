@@ -85,11 +85,11 @@ export function generateReport(
   const closed = trades.filter((t) => t.status === 'CLOSED');
   const open = trades.filter((t) => t.status === 'OPEN');
 
-  // P&L
-  const realizedPnl = closed.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
+  // P&L — use actual balance change as realized (D1 pnl may be incomplete)
+  const realizedPnl = currentBalance - startingBalance;
   const totalFees = trades.reduce((sum, t) => sum + t.fee, 0);
   const totalPnl = realizedPnl + unrealizedPnl;
-  const netPnl = totalPnl - totalFees;
+  const netPnl = totalPnl; // fees already reflected in balance
 
   // Win / loss (pnl === 0 = breakeven, not counted as win or loss)
   const wins = closed.filter((t) => (t.pnl ?? 0) > 0);
@@ -163,7 +163,9 @@ export function generateReport(
   for (const key of Object.keys(byStrategy)) {
     const stratTrades = closed.filter((t) => (t.strategy || 'unknown') === key);
     const stratWins = stratTrades.filter((t) => (t.pnl ?? 0) > 0).length;
-    byStrategy[key].winRate = stratTrades.length > 0 ? stratWins / stratTrades.length : 0;
+    const stratLosses = stratTrades.filter((t) => (t.pnl ?? 0) < 0).length;
+    const stratDecided = stratWins + stratLosses;
+    byStrategy[key].winRate = stratDecided > 0 ? stratWins / stratDecided : 0;
   }
 
   const returnPercent = startingBalance > 0
@@ -284,9 +286,9 @@ export function formatReportTelegram(report: PerformanceReport): string {
 
   // P&L
   msg += `${pnlEmoji} <b>P&L</b>\n`;
-  msg += `  Realized: ${fmtPnl(report.realizedPnl)}\n`;
-  msg += `  Fees: -$${report.totalFees.toFixed(2)}\n`;
-  msg += `  <b>Net realized: ${fmtPnl(report.realizedPnl - report.totalFees)}</b>\n\n`;
+  msg += `  Realized (incl. fees): <code>${fmtPnl(report.realizedPnl)}</code>\n`;
+  msg += `  Unrealized: <code>${fmtPnl(report.unrealizedPnl)}</code>\n`;
+  msg += `  <b>Total: ${fmtPnl(report.totalPnl)}</b>\n\n`;
 
   // Win / Loss
   msg += `\u{1F3AF} <b>Win/Loss</b>\n`;
