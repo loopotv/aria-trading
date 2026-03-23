@@ -21,6 +21,7 @@ import { ExperienceDB } from './experience';
 import { costTracker, extractJson } from '../wavespeed/client';
 import { callQwenStrategist } from '../wavespeed/nvidia';
 import type { AiBinding } from '../wavespeed/workers-ai';
+import { callKimiStrategist } from '../wavespeed/workers-ai';
 import type { SentimentSignal, SentimentSnapshot } from '../sentiment/types';
 import type { RawTextItem } from '../ingestion/sources';
 
@@ -444,42 +445,78 @@ export class TradingEngine {
           'Respond with JSON: {"execute": true/false, "reasoning": "...", "adjustedSL": number|null, "adjustedTP": number|null, "riskScore": 1-10}',
         ].join('\n');
 
-        console.log(`[Strategist] Calling Qwen3.5 for ${symbol} ${setup.direction}...`);
+        console.log(`[Strategist] Calling Qwen3.5 + Kimi K2 (A/B) for ${symbol} ${setup.direction}...`);
 
-        const strategistResult = await callQwenStrategist(this.nvidiaKey, {
-          prompt: strategistPrompt,
-          systemPrompt: `You are an expert crypto trading strategist. Analyze the trade setup and decide whether to execute. Be conservative - only approve trades with clear edge. Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sentences", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. No other text.`,
-          temperature: 0.3,
-          maxTokens: 512,
-          enableThinking: false,
-        });
-
-        console.log(`[Strategist] Qwen3.5 responded in ${strategistResult.inferenceMs}ms, cost: $${strategistResult.estimatedCost.toFixed(4)}`);
-        console.log(`[Strategist] Content length: ${strategistResult.text?.length}, first 200: ${strategistResult.text?.slice(0, 200)}`);
-        console.log(`[Strategist] Thinking length: ${strategistResult.thinkingText?.length}`);
-
-        // Parse strategist decision - try content first, fallback to thinking
         type StrategistDecision = {
           execute?: boolean;
           reasoning?: string;
-          reason?: string;      // Qwen sometimes uses "reason" instead of "reasoning"
+          reason?: string;
           adjustedSL?: number;
-          adjusted_sl?: number; // snake_case variant
+          adjusted_sl?: number;
           adjustedTP?: number;
           adjusted_tp?: number;
           riskScore?: number;
-          risk_score?: number;  // snake_case variant
-          risk?: number;        // short variant
+          risk_score?: number;
+          risk?: number;
         };
-        let decision = extractJson(strategistResult.text) as StrategistDecision | null;
-        if (!decision && strategistResult.thinkingText) {
-          console.log(`[Strategist] No JSON in content (len=${strategistResult.text?.length}), trying thinking (len=${strategistResult.thinkingText?.length})...`);
-          decision = extractJson(strategistResult.thinkingText) as StrategistDecision | null;
+
+        const strategistSystemPrompt = `You are an expert crypto trading strategist. Analyze the trade setup and decide whether to execute. Be conservative - only approve trades with clear edge. Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sentences", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. No other text.`;
+
+        // A/B test: run Qwen3.5 and Kimi K2 in parallel
+        const [strategistResult, kimiResult] = await Promise.allSettled([
+          callQwenStrategist(this.nvidiaKey, {
+            prompt: strategistPrompt,
+            systemPrompt: strategistSystemPrompt,
+            temperature: 0.3,
+            maxTokens: 512,
+            enableThinking: false,
+          }),
+          this.ai ? callKimiStrategist(this.ai, {
+            prompt: strategistPrompt,
+            systemPrompt: strategistSystemPrompt,
+            temperature: 0.3,
+            maxTokens: 512,
+          }) : Promise.reject(new Error('No AI binding')),
+        ]);
+
+        // Log Kimi K2 A/B result (does NOT affect trading decisions)
+        if (kimiResult.status === 'fulfilled') {
+          const kimiDecision = extractJson(kimiResult.value.text) as StrategistDecision | null;
+          if (kimiDecision) {
+            if (!kimiDecision.reasoning && kimiDecision.reason) kimiDecision.reasoning = kimiDecision.reason;
+            if (!kimiDecision.riskScore && kimiDecision.risk_score) kimiDecision.riskScore = kimiDecision.risk_score;
+            if (!kimiDecision.riskScore && kimiDecision.risk) kimiDecision.riskScore = kimiDecision.risk;
+          }
+          await this.telegram.sendMessage(
+            `🔬 <b>A/B: Kimi K2</b> ${kimiDecision?.execute ? '✅ APPROVE' : '❌ REJECT'}\n` +
+            `<b>Risk:</b> ${kimiDecision?.riskScore || '?'}/10\n` +
+            `<b>Reasoning:</b> <i>${kimiDecision?.reasoning?.slice(0, 200) || 'N/A'}</i>\n` +
+            `⏱ ${kimiResult.value.inferenceMs}ms | FREE (Workers AI)`
+          );
+          console.log(`[A/B Kimi] ${kimiDecision?.execute ? 'APPROVE' : 'REJECT'} | Risk: ${kimiDecision?.riskScore} | ${kimiResult.value.inferenceMs}ms`);
+        } else {
+          console.warn(`[A/B Kimi] Failed: ${kimiResult.reason?.message?.slice(0, 100)}`);
+        }
+
+        // Use Qwen result (primary strategist)
+        if (strategistResult.status === 'rejected') {
+          throw strategistResult.reason;
+        }
+        const qwenResult = strategistResult.value;
+
+        console.log(`[Strategist] Qwen3.5 responded in ${qwenResult.inferenceMs}ms, cost: $${qwenResult.estimatedCost.toFixed(4)}`);
+        console.log(`[Strategist] Content length: ${qwenResult.text?.length}, first 200: ${qwenResult.text?.slice(0, 200)}`);
+        console.log(`[Strategist] Thinking length: ${qwenResult.thinkingText?.length}`);
+
+        // Parse strategist decision - try content first, fallback to thinking
+        let decision = extractJson(qwenResult.text) as StrategistDecision | null;
+        if (!decision && qwenResult.thinkingText) {
+          console.log(`[Strategist] No JSON in content (len=${qwenResult.text?.length}), trying thinking (len=${qwenResult.thinkingText?.length})...`);
+          decision = extractJson(qwenResult.thinkingText) as StrategistDecision | null;
         }
         if (!decision) {
-          // Log what we got for debugging
-          console.log(`[Strategist] JSON extraction FAILED. Content: ${strategistResult.text?.slice(0, 500)}`);
-          console.log(`[Strategist] Thinking tail: ${strategistResult.thinkingText?.slice(-500)}`);
+          console.log(`[Strategist] JSON extraction FAILED. Content: ${qwenResult.text?.slice(0, 500)}`);
+          console.log(`[Strategist] Thinking tail: ${qwenResult.thinkingText?.slice(-500)}`);
         }
 
         console.log(`[Strategist] Parsed decision: ${JSON.stringify(decision)?.slice(0, 300)}`);
@@ -525,8 +562,8 @@ export class TradingEngine {
           `<b>SL:</b> $${setup.stopLoss.toFixed(4)} | <b>TP:</b> $${setup.takeProfit.toFixed(4)}\n` +
           `<b>Risk:</b> ${decision?.riskScore || '?'}/10\n` +
           `<b>Reasoning:</b> <i>${decision?.reasoning?.slice(0, 200) || 'N/A'}</i>\n` +
-          (strategistResult.thinkingText ? `\n💭 <b>Thinking:</b> <i>${strategistResult.thinkingText.slice(0, 300)}...</i>` : '') +
-          `\n⏱ ${strategistResult.inferenceMs}ms | FREE (NVIDIA)`
+          (qwenResult.thinkingText ? `\n💭 <b>Thinking:</b> <i>${qwenResult.thinkingText.slice(0, 300)}...</i>` : '') +
+          `\n⏱ ${qwenResult.inferenceMs}ms | FREE (NVIDIA)`
         );
       } catch (stratErr) {
         // If strategist fails, proceed with original setup (fail-open)
@@ -685,7 +722,9 @@ export class TradingEngine {
 
       // Check minimum notional
       if (info && quantity * price < info.minNotional) {
-        console.log(`[Trade] ${symbol} notional $${(quantity * price).toFixed(2)} below min $${info.minNotional}, skipping`);
+        const msg = `[Trade] ${symbol} notional $${(quantity * price).toFixed(2)} below min $${info.minNotional}, skipping`;
+        console.log(msg);
+        await this.telegram.sendMessage(`⏸ <b>${symbol} ${direction} SKIPPED</b>\nNotional $${(quantity * price).toFixed(2)} below $${info.minNotional} minimum`);
         return;
       }
 

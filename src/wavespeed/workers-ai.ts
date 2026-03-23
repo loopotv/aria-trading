@@ -1,6 +1,5 @@
 /**
- * Workers AI client for Llama 4 Scout.
- * Used for batch news classification (low-impact items).
+ * Workers AI client for Llama 4 Scout and Kimi K2.
  * Free tier: 10,000 neurons/day on Cloudflare Workers AI.
  */
 
@@ -45,6 +44,44 @@ export async function callWorkersAI(
   const inputTokens = Math.ceil((opts.prompt.length + opts.systemPrompt.length) / 4);
   const outputTokens = Math.ceil(text.length / 4);
   costTracker.track('workers-ai/llama-4-scout', inputTokens, outputTokens);
+
+  return {
+    text: text.trim(),
+    inferenceMs,
+    estimatedCost: 0, // Free!
+  };
+}
+
+/**
+ * Call Kimi K2 via Workers AI binding.
+ * Used as A/B test strategist — runs in parallel with Qwen3.5.
+ */
+export async function callKimiStrategist(
+  ai: AiBinding,
+  opts: {
+    prompt: string;
+    systemPrompt: string;
+    temperature?: number;
+    maxTokens?: number;
+  }
+): Promise<{ text: string; inferenceMs: number; estimatedCost: number }> {
+  const start = Date.now();
+
+  const result = await ai.run('@cf/moonshotai/kimi-k2-instruct', {
+    messages: [
+      { role: 'system', content: opts.systemPrompt },
+      { role: 'user', content: opts.prompt },
+    ],
+    max_tokens: opts.maxTokens ?? 512,
+    temperature: opts.temperature ?? 0.3,
+  });
+
+  const inferenceMs = Date.now() - start;
+  const text = result.response || '';
+
+  const inputTokens = Math.ceil((opts.prompt.length + opts.systemPrompt.length) / 4);
+  const outputTokens = Math.ceil(text.length / 4);
+  costTracker.track('workers-ai/kimi-k2', inputTokens, outputTokens);
 
   return {
     text: text.trim(),

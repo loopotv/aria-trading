@@ -445,7 +445,7 @@ function getEngine(env: Bindings): TradingEngine {
       ],
       leverage: isHyperliquid ? 3 : 10,
       riskPerTrade: isHyperliquid ? 2 : 2,
-      maxPositionSizeUsdt: isHyperliquid ? 10 : 500,
+      maxPositionSizeUsdt: isHyperliquid ? 15 : 500,
       maxPositions: isHyperliquid ? 3 : 6,
       enableEventDriven: true,
       enableMarketNeutral: !isHyperliquid, // Disable for now (no hedge mode)
