@@ -906,6 +906,7 @@ export class TradingEngine {
             positionSide: order.direction as 'LONG' | 'SHORT',
             type: 'MARKET',
             quantity: posAmt,
+            reduceOnly: true,
           });
 
           console.log(`[SoftSL/TP] CLOSED ${order.symbol} ${order.direction}: ${reason} | P&L: $${pnl.toFixed(2)}`);
