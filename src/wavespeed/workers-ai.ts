@@ -90,16 +90,23 @@ export async function callStrategist(
       });
 
       const inferenceMs = Date.now() - start;
-      const text = result.response || '';
+      const text = (result.response || '').trim();
+
+      // Treat empty response as failure — try next model
+      if (!text) {
+        errors.push(`${model.name}: empty response (${inferenceMs}ms)`);
+        console.warn(`[Strategist] ${model.name} returned empty, trying next...`);
+        continue;
+      }
 
       const inputTokens = Math.ceil((opts.prompt.length + opts.systemPrompt.length) / 4);
       const outputTokens = Math.ceil(text.length / 4);
       costTracker.track(`workers-ai/${model.name}`, inputTokens, outputTokens);
 
-      console.log(`[Strategist] ${model.name} responded in ${inferenceMs}ms`);
+      console.log(`[Strategist] ${model.name} responded in ${inferenceMs}ms (${text.length} chars)`);
 
       return {
-        text: text.trim(),
+        text,
         inferenceMs,
         estimatedCost: 0,
         model: model.name,
