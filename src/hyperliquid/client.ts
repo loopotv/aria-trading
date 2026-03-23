@@ -393,14 +393,16 @@ export class HyperliquidClient implements IExchange {
 
     const tpsl = params.type === 'TAKE_PROFIT_MARKET' ? 'tp' : 'sl';
 
-    // For closePosition, we need to get current position size
+    // Use explicit quantity if provided, otherwise fetch from position
     let size: string;
-    if (params.closePosition) {
+    if (params.quantity) {
+      size = floatToWire(params.quantity, szDecimals);
+    } else if (params.closePosition) {
       const positions = await this.getPositionRisk();
       const pos = positions.find(p => p.symbol === params.symbol);
       size = pos ? floatToWire(Math.abs(parseFloat(pos.positionAmt)), szDecimals) : '0';
     } else {
-      size = floatToWire(params.quantity!, szDecimals);
+      size = '0';
     }
 
     const roundedTrigger = this.roundPrice(params.symbol, params.triggerPrice);

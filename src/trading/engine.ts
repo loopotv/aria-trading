@@ -753,12 +753,14 @@ export class TradingEngine {
           positionSide: direction as 'LONG' | 'SHORT',
           type: 'STOP_MARKET',
           triggerPrice: roundedSL,
-          closePosition: true,
+          quantity,
         });
         slPlaced = true;
-        console.log(`[Trade] SL placed on Binance @ ${roundedSL}`);
+        console.log(`[Trade] SL placed @ ${roundedSL}`);
       } catch (slErr) {
-        console.warn(`[Trade] Algo SL failed: ${(slErr as Error).message?.slice(0, 80)}`);
+        const slErrMsg = (slErr as Error).message?.slice(0, 100);
+        console.warn(`[Trade] Algo SL failed: ${slErrMsg}`);
+        await this.telegram.sendMessage(`⚠️ SL order failed: ${slErrMsg}`);
       }
 
       try {
@@ -769,11 +771,14 @@ export class TradingEngine {
           type: 'TAKE_PROFIT_MARKET',
           triggerPrice: roundedTP,
           closePosition: true,
+          quantity,
         });
         tpPlaced = true;
-        console.log(`[Trade] TP placed on Binance @ ${roundedTP}`);
+        console.log(`[Trade] TP placed @ ${roundedTP}`);
       } catch (tpErr) {
-        console.warn(`[Trade] Algo TP failed: ${(tpErr as Error).message?.slice(0, 80)}`);
+        const tpErrMsg = (tpErr as Error).message?.slice(0, 100);
+        console.warn(`[Trade] Algo TP failed: ${tpErrMsg}`);
+        await this.telegram.sendMessage(`⚠️ TP order failed: ${tpErrMsg}`);
       }
 
       // Save to experience DB
