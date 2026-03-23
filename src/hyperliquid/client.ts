@@ -125,9 +125,14 @@ export class HyperliquidClient implements IExchange {
     return res.json();
   }
 
-  /** Get price precision based on szDecimals */
-  private pricePrecision(szDecimals: number): number {
-    return Math.max(0, 6 - szDecimals);
+  /**
+   * Get price precision (max decimals) for a given price.
+   * Hyperliquid uses 5 significant figures for prices.
+   */
+  private priceDecimalsForValue(price: number): number {
+    if (price <= 0) return 2;
+    const order = Math.floor(Math.log10(price));
+    return Math.max(0, 5 - order - 1);
   }
 
   // --- IExchange Implementation ---
@@ -146,7 +151,7 @@ export class HyperliquidClient implements IExchange {
         maxLeverage: asset.maxLeverage,
       });
 
-      const priceDecimals = this.pricePrecision(asset.szDecimals);
+      const priceDecimals = 2; // placeholder — actual decimals computed dynamically from price
       const stepSize = Math.pow(10, -asset.szDecimals);
       const tickSize = Math.pow(10, -priceDecimals);
       const symbol = this.fromHlSymbol(asset.name);
@@ -182,12 +187,12 @@ export class HyperliquidClient implements IExchange {
     return parseFloat(rounded.toFixed(info.quantityPrecision));
   }
 
-  roundPrice(symbol: string, price: number): number {
-    const info = this.symbolPrecisionCache.get(symbol);
-    if (!info) return Math.round(price * 100) / 100;
-    const tick = info.tickSize;
+  roundPrice(_symbol: string, price: number): number {
+    // Hyperliquid: 5 significant figures, decimals depend on price magnitude
+    const decimals = this.priceDecimalsForValue(price);
+    const tick = Math.pow(10, -decimals);
     const rounded = Math.round(price / tick) * tick;
-    return parseFloat(rounded.toFixed(info.pricePrecision));
+    return parseFloat(rounded.toFixed(decimals));
   }
 
   async getPrice(symbol: string): Promise<number> {
@@ -342,10 +347,11 @@ export class HyperliquidClient implements IExchange {
       const currentPrice = await this.getPrice(params.symbol);
       const slippage = isBuy ? 1.01 : 0.99;
       const aggPrice = this.roundPrice(params.symbol, currentPrice * slippage);
-      price = floatToWire(aggPrice, this.pricePrecision(szDecimals));
+      price = floatToWire(aggPrice, this.priceDecimalsForValue(aggPrice));
       tif = 'Ioc';
     } else {
-      price = floatToWire(params.price!, this.pricePrecision(szDecimals));
+      const roundedPrice = this.roundPrice(params.symbol, params.price!);
+      price = floatToWire(roundedPrice, this.priceDecimalsForValue(roundedPrice));
       tif = params.timeInForce === 'IOC' ? 'Ioc' : params.timeInForce === 'FOK' ? 'Fok' : 'Gtc';
     }
 
@@ -394,15 +400,18 @@ export class HyperliquidClient implements IExchange {
       size = floatToWire(params.quantity!, szDecimals);
     }
 
+    const roundedTrigger = this.roundPrice(params.symbol, params.triggerPrice);
+    const triggerDecimals = this.priceDecimalsForValue(roundedTrigger);
+
     const order = {
       a: assetIdx,
       b: isBuy,
-      p: floatToWire(params.triggerPrice, this.pricePrecision(szDecimals)),
+      p: floatToWire(roundedTrigger, triggerDecimals),
       s: size,
       r: true, // TP/SL are always reduce-only
       t: {
         trigger: {
-          triggerPx: floatToWire(params.triggerPrice, this.pricePrecision(szDecimals)),
+          triggerPx: floatToWire(roundedTrigger, triggerDecimals),
           isMarket: true,
           tpsl,
         },
