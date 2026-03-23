@@ -57,11 +57,9 @@ export async function callWorkersAI(
  * Falls through to next if current model is unavailable.
  */
 const STRATEGIST_MODELS = [
-  { id: '@cf/qwen/qwen3-32b', name: 'Qwen 3 32B' },
-  { id: '@cf/qwen/qwen2.5-72b-instruct', name: 'Qwen 2.5 72B' },
-  { id: '@cf/deepseek/deepseek-r1-distill-qwen-32b', name: 'DeepSeek R1 32B' },
-  { id: '@cf/mistral/mistral-small-3.1-24b-instruct', name: 'Mistral 3.1 24B' },
-  { id: '@cf/moonshotai/kimi-k2-instruct', name: 'Kimi K2' },
+  { id: '@cf/moonshotai/kimi-k2.5', name: 'Kimi K2.5' },
+  { id: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', name: 'DeepSeek R1 32B' },
+  { id: '@cf/qwen/qwen2.5-coder-32b-instruct', name: 'Qwen 2.5 Coder 32B' },
 ];
 
 /**
