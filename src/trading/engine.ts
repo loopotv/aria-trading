@@ -21,7 +21,7 @@ import { ExperienceDB } from './experience';
 import { costTracker, extractJson } from '../wavespeed/client';
 import { callQwenStrategist } from '../wavespeed/nvidia';
 import type { AiBinding } from '../wavespeed/workers-ai';
-import { callKimiStrategist } from '../wavespeed/workers-ai';
+import { callStrategist } from '../wavespeed/workers-ai';
 import type { SentimentSignal, SentimentSnapshot } from '../sentiment/types';
 import type { RawTextItem } from '../ingestion/sources';
 
@@ -464,20 +464,20 @@ export class TradingEngine {
 
         if (!this.ai) throw new Error('No AI binding for strategist');
 
-        const kimiResult = await callKimiStrategist(this.ai, {
+        const stratResult = await callStrategist(this.ai, {
           prompt: strategistPrompt,
           systemPrompt: strategistSystemPrompt,
           temperature: 0.3,
           maxTokens: 512,
         });
 
-        console.log(`[Strategist] Kimi K2 responded in ${kimiResult.inferenceMs}ms`);
-        console.log(`[Strategist] Content: ${kimiResult.text?.slice(0, 300)}`);
+        console.log(`[Strategist] ${stratResult.model} responded in ${stratResult.inferenceMs}ms`);
+        console.log(`[Strategist] Content: ${stratResult.text?.slice(0, 300)}`);
 
         // Parse strategist decision
-        let decision = extractJson(kimiResult.text) as StrategistDecision | null;
+        let decision = extractJson(stratResult.text) as StrategistDecision | null;
         if (!decision) {
-          console.log(`[Strategist] JSON extraction FAILED. Content: ${kimiResult.text?.slice(0, 500)}`);
+          console.log(`[Strategist] JSON extraction FAILED. Content: ${stratResult.text?.slice(0, 500)}`);
         }
 
         console.log(`[Strategist] Parsed decision: ${JSON.stringify(decision)?.slice(0, 300)}`);
@@ -494,7 +494,7 @@ export class TradingEngine {
         if (decision && !decision.execute) {
           console.log(`[Strategist] REJECTED: ${decision.reasoning?.slice(0, 100)}`);
           await this.telegram.sendMessage(
-            `🧠 <b>Strategist (Kimi K2) REJECTED</b>\n\n` +
+            `🧠 <b>Strategist (${stratResult.model}) REJECTED</b>\n\n` +
             `<b>Trade:</b> ${setup.direction} ${symbol}\n` +
             `<b>Reason:</b> <i>${decision.reasoning?.slice(0, 200)}</i>\n` +
             `<b>Risk Score:</b> ${decision.riskScore || '?'}/10`
@@ -518,12 +518,12 @@ export class TradingEngine {
 
         // Notify
         await this.telegram.sendMessage(
-          `🧠 <b>Strategist (Kimi K2) APPROVED</b>\n\n` +
+          `🧠 <b>Strategist (${stratResult.model}) APPROVED</b>\n\n` +
           `<b>Trade:</b> ${setup.direction} ${symbol} @ $${currentPrice.toFixed(4)}\n` +
           `<b>SL:</b> $${setup.stopLoss.toFixed(4)} | <b>TP:</b> $${setup.takeProfit.toFixed(4)}\n` +
           `<b>Risk:</b> ${decision?.riskScore || '?'}/10\n` +
           `<b>Reasoning:</b> <i>${decision?.reasoning?.slice(0, 200) || 'N/A'}</i>\n` +
-          `⏱ ${kimiResult.inferenceMs}ms | FREE (Workers AI)`
+          `⏱ ${stratResult.inferenceMs}ms | FREE (Workers AI)`
         );
       } catch (stratErr) {
         // If strategist fails, DO NOT proceed (fail-closed)
