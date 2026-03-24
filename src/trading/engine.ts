@@ -567,6 +567,15 @@ export class TradingEngine {
       return;
     }
 
+    // Check if already have a position on this symbol (Hyperliquid merges same-direction positions)
+    const hasPosition = account.positions.some(
+      (p: any) => p.symbol === symbol && parseFloat(p.positionAmt) !== 0
+    );
+    if (hasPosition) {
+      console.log(`[Event] Already have position on ${symbol}, skipping`);
+      return;
+    }
+
     // Execute trade
     console.log(`[Event] Executing trade: ${setup.direction} ${symbol}, balance: ${account.availableBalance}`);
     const balance = parseFloat(account.availableBalance);
