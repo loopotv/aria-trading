@@ -363,6 +363,18 @@ export class ExperienceDB {
     }
   }
 
+  /** Get last closed trade for a symbol (for cooldown logic) */
+  async getLastTrade(symbol: string): Promise<{ pnl: number; closed_at: string } | null> {
+    return this.db
+      .prepare(
+        `SELECT pnl, closed_at FROM trades
+        WHERE symbol = ? AND status = 'CLOSED'
+        ORDER BY closed_at DESC LIMIT 1`
+      )
+      .bind(symbol)
+      .first<{ pnl: number; closed_at: string }>();
+  }
+
   // ---- CONTEXT QUERIES (for LLM enrichment) ----
 
   /** Get recent trade history for a symbol to provide context to LLM */

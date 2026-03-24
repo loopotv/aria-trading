@@ -397,6 +397,24 @@ export class TradingEngine {
       return;
     }
 
+    // Cooldown: skip asset if last trade on it was a loss within 2 hours
+    if (this.experience) {
+      try {
+        const recentTrade = await this.experience.getLastTrade(symbol);
+        if (recentTrade && recentTrade.pnl < 0) {
+          const closedAt = new Date(recentTrade.closed_at).getTime();
+          const cooldownMs = 2 * 60 * 60 * 1000; // 2 hours
+          if (Date.now() - closedAt < cooldownMs) {
+            const minsLeft = Math.ceil((cooldownMs - (Date.now() - closedAt)) / 60000);
+            console.log(`[Event] ${symbol} on cooldown after loss (${minsLeft}min left), skipping`);
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn(`[Event] Cooldown check failed: ${(e as Error).message}`);
+      }
+    }
+
     const highs = klines.map((k: any) => parseFloat(k[2]));
     const lows = klines.map((k: any) => parseFloat(k[3]));
     const closes = klines.map((k: any) => parseFloat(k[4]));
@@ -416,6 +434,17 @@ export class TradingEngine {
 
     if (!setup.approved) {
       console.log(`[Event] Filtered: ${setup.reason}`);
+      return;
+    }
+
+    // Hard regime filter: block counter-regime trades with low confidence
+    const regime = this.currentRegime?.regime;
+    if (regime === 'EXTREME_FEAR' && setup.direction === 'LONG' && signal.confidence < 0.85) {
+      console.log(`[Event] ${symbol} LONG blocked: EXTREME_FEAR regime + confidence ${signal.confidence.toFixed(2)} < 0.85`);
+      return;
+    }
+    if (regime === 'EXTREME_GREED' && setup.direction === 'SHORT' && signal.confidence < 0.85) {
+      console.log(`[Event] ${symbol} SHORT blocked: EXTREME_GREED regime + confidence ${signal.confidence.toFixed(2)} < 0.85`);
       return;
     }
 
@@ -460,7 +489,14 @@ export class TradingEngine {
           risk?: number;
         };
 
-        const strategistSystemPrompt = `You are an expert crypto trading strategist. Analyze the trade setup and decide whether to execute. Be conservative - only approve trades with clear edge. Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sentences", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. No other text.`;
+        const strategistSystemPrompt = `You are an expert crypto trading strategist managing a small account ($60). Rules:
+1. Be VERY conservative - only approve trades with clear edge.
+2. REJECT if historical context shows losing pattern (low win rate, negative avg PnL) for this asset/direction/regime.
+3. In EXTREME_FEAR regime: only approve LONG if confidence >= 0.85 AND magnitude >= 0.7. Prefer SHORT.
+4. In EXTREME_GREED regime: only approve SHORT if confidence >= 0.85 AND magnitude >= 0.7. Prefer LONG.
+5. If the same asset has been traded too recently or has a poor track record, REJECT.
+6. Weight historical data heavily - past losses on this setup should bias towards rejection.
+Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sentences", "riskScore": 1-10, "adjustedSL": number_or_null, "adjustedTP": number_or_null}. No other text.`;
 
         if (!this.ai) throw new Error('No AI binding for strategist');
 
