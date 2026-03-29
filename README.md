@@ -67,8 +67,16 @@ ARIA monitors crypto news in real-time, classifies events through a pipeline of 
   │   └──────────────┬───────────────────┘                             │
   │                  │                                                  │
   │                  ▼                                                  │
+  │   ┌──────────────────────────────────┐                             │
+  │   │     Composite Score (0-100)      │                             │
+  │   │  Sentiment 25% | Momentum 25%   │                             │
+  │   │  Volatility 20% | Trend 15%     │                             │
+  │   │  Regime 15%  → size scaling     │                             │
+  │   └──────────────┬───────────────────┘                             │
+  │                  │ (score >= 40)                                    │
+  │                  ▼                                                  │
   │   ┌──────────────────────────────────┐    ┌───────────────────┐    │
-  │   │     Kimi K2 Strategist           │◄───│  Experience DB    │    │
+  │   │     Kimi K2.5 Strategist         │◄───│  Experience DB    │    │
   │   │  (approve/reject + adjust SL/TP) │    │  (D1 - patterns,  │    │
   │   │  FREE on Workers AI              │    │   trade history)  │    │
   │   └──────────────┬───────────────────┘    └───────────────────┘    │
@@ -99,11 +107,11 @@ ARIA uses a tiered LLM architecture where each model has a specific role, optimi
 |---|---|---|---|---|
 | Batch Classifier | Llama 4 Scout 17B | Cloudflare Workers AI | $0 (free tier) | Every 5 min -- classifies all normal news items |
 | High-Impact Analyst | Claude Sonnet 4.5 | WaveSpeed | ~$0.002/call | On breaking news -- deep sentiment analysis |
-| Strategist | Kimi K2 | Cloudflare Workers AI | $0 (free tier) | On strong signals -- trade approval/rejection |
+| Strategist | Kimi K2.5 | Cloudflare Workers AI | $0 (free tier) | On strong signals -- trade approval/rejection |
 | Fallback | Claude Haiku 4.5 | WaveSpeed | ~$0.001/call | Only if primary providers are down |
 | Executor | TypeScript Engine | Cloudflare Workers | $0 | Always -- risk management, order execution |
 
-The LLM layer acts purely as a **sensor** -- it classifies and extracts structured data from news. It never decides to buy or sell. All trading decisions go through the quantitative filter, strategist validation, and risk management engine.
+The LLM layer acts purely as a **sensor** -- it classifies and extracts structured data from news. It never decides to buy or sell. All trading decisions go through the quantitative filter, composite scoring, strategist validation, and risk management engine.
 
 ## Supported Exchanges
 
@@ -127,6 +135,27 @@ The regime detector analyzes Fear & Greed Index and BTC 24h price action to adap
 | **EXTREME_GREED** | F&G >= 80 | 7x | 0.5x | 0.5x | 1.3x | 4 |
 
 Each regime also adjusts stop-loss/take-profit multipliers, minimum confidence thresholds, and rebalancing intervals.
+
+## Composite Scoring System
+
+Every trade candidate is scored 0-100 across five dimensions before reaching the strategist. This replaces simple threshold-based filters with a nuanced multi-factor quality gate.
+
+| Component | Weight | What it measures |
+|---|---|---|
+| **Sentiment** | 25% | LLM sentiment strength, confidence, magnitude, direction alignment |
+| **Momentum** | 25% | RSI zones, MACD histogram direction, MACD crossover |
+| **Volatility** | 20% | ATR range (moderate is best), Bollinger Band position, volume ratio |
+| **Trend** | 15% | ADX strength, directional indicator alignment, EMA20 position |
+| **Regime** | 15% | Fear & Greed alignment with trade direction |
+
+| Score Range | Action | Size Multiplier |
+|---|---|---|
+| 80-100 | Strong setup -- full size | 1.0x |
+| 60-79 | Decent setup -- reduced size | 0.7x |
+| 40-59 | Weak setup -- minimal size | 0.4x |
+| 0-39 | Poor setup -- trade rejected | 0x |
+
+The composite score is passed to the strategist LLM alongside historical context, giving it quantitative backing for its approval/rejection decision.
 
 ## Telegram Commands
 
@@ -273,6 +302,7 @@ aria-trading/
 │   │   └── types.ts                     # Sentiment type definitions
 │   ├── trading/
 │   │   ├── engine.ts                     # Main trading engine (pipeline orchestrator)
+│   │   ├── composite-score.ts           # Multi-factor trade quality scoring (0-100)
 │   │   ├── regime.ts                     # Market regime detector (5 regimes)
 │   │   ├── experience.ts                # Experience database (D1-backed learning)
 │   │   ├── audit.ts                      # Automated health check system
@@ -289,7 +319,7 @@ aria-trading/
 │   └── wavespeed/
 │       ├── client.ts                     # WaveSpeed LLM gateway + cost tracker
 │       ├── nvidia.ts                     # NVIDIA NIM client (legacy, unused)
-│       └── workers-ai.ts                # Workers AI client (Llama 4 Scout + Kimi K2)
+│       └── workers-ai.ts                # Workers AI client (Llama 4 Scout + Kimi K2.5)
 ├── tests/                                # Test suite (Vitest)
 ├── schema.sql                            # D1 database schema
 ├── wrangler.toml                         # Cloudflare Workers configuration
@@ -311,9 +341,12 @@ aria-trading/
 
 ## Roadmap
 
+- [x] News deduplication in D1 to prevent trading on repeated events
+- [x] Composite scoring system (multi-factor trade quality gate)
+- [ ] Twitter/X bot for trade transparency and social sentiment ingestion
+- [ ] Kelly Criterion position sizing based on historical win/loss statistics
 - [ ] Web dashboard (Cloudflare Pages)
-- [ ] Expanded backtesting framework
-- [ ] News deduplication in D1 to prevent trading on repeated events
+- [ ] Expanded backtesting framework with walk-forward validation
 - [ ] Additional strategies (mean reversion, momentum)
 - [ ] Additional exchange support (Bybit, OKX)
 - [ ] On-chain data integration
