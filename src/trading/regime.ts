@@ -38,9 +38,9 @@ export function detectRegime(input: RegimeInput): RegimeParams {
 
   let regime: MarketRegime;
 
-  if (fearGreedValue <= 15) {
+  if (fearGreedValue <= 25) {
     regime = 'EXTREME_FEAR';
-  } else if (fearGreedValue >= 80) {
+  } else if (fearGreedValue >= 75) {
     regime = 'EXTREME_GREED';
   } else if (fearGreedValue < 40 && btcPriceChange24h < -2) {
     regime = 'RISK_OFF';

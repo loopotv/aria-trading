@@ -128,11 +128,11 @@ The regime detector analyzes Fear & Greed Index and BTC 24h price action to adap
 
 | Regime | Condition | Leverage | Size | Long Bias | Short Bias | Max Positions |
 |---|---|---|---|---|---|---|
-| **EXTREME_FEAR** | F&G <= 15 | 5x | 0.5x | 0.3x | 1.8x | 4 |
+| **EXTREME_FEAR** | F&G <= 25 | 5x | 0.5x | 0.3x | 1.8x | 4 |
 | **RISK_OFF** | F&G < 40 & BTC < -2% | 5x | 0.6x | 0.5x | 1.5x | 5 |
 | **NEUTRAL** | Default | 10x | 1.0x | 1.0x | 1.0x | 8 |
 | **RISK_ON** | F&G > 55 & BTC > +2% | 15x | 1.3x | 1.5x | 0.5x | 8 |
-| **EXTREME_GREED** | F&G >= 80 | 7x | 0.5x | 0.5x | 1.3x | 4 |
+| **EXTREME_GREED** | F&G >= 75 | 7x | 0.5x | 0.5x | 1.3x | 4 |
 
 Each regime also adjusts stop-loss/take-profit multipliers, minimum confidence thresholds, and rebalancing intervals.
 
