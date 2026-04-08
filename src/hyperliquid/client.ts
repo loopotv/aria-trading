@@ -89,7 +89,19 @@ export class HyperliquidClient implements IExchange {
     return this.cachedState;
   }
 
+  // Rate limiter: min 200ms between API calls to avoid 429
+  private lastApiCall = 0;
+  private async rateLimit(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastApiCall;
+    if (elapsed < 200) {
+      await new Promise(r => setTimeout(r, 200 - elapsed));
+    }
+    this.lastApiCall = Date.now();
+  }
+
   private async infoPost<T>(body: any): Promise<T> {
+    await this.rateLimit();
     const res = await fetch(`${this.baseUrl}/info`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -106,6 +118,7 @@ export class HyperliquidClient implements IExchange {
   }
 
   private async exchangePost(action: any): Promise<any> {
+    await this.rateLimit();
     const nonce = Date.now();
     const signature = await signL1Action(
       this.privateKey, action, nonce, this.isTestnet, this.vaultAddress
