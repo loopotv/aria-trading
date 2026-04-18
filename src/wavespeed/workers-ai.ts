@@ -28,7 +28,7 @@ export async function callWorkersAI(
 ): Promise<{ text: string; inferenceMs: number; estimatedCost: number }> {
   const start = Date.now();
 
-  const result = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+  const result: any = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
     messages: [
       { role: 'system', content: opts.systemPrompt },
       { role: 'user', content: opts.prompt },
@@ -38,7 +38,7 @@ export async function callWorkersAI(
   });
 
   const inferenceMs = Date.now() - start;
-  const text = result.response || '';
+  const text = extractText(result);
 
   // Track as $0 cost (free tier)
   const inputTokens = Math.ceil((opts.prompt.length + opts.systemPrompt.length) / 4);
@@ -53,14 +53,32 @@ export async function callWorkersAI(
 }
 
 /**
- * Strategist models in priority order.
- * Falls through to next if current model is unavailable.
+ * Strategist models in priority order. Falls through if current is unavailable.
+ *
+ * Selected via live latency/JSON benchmark (2026-04-18):
+ *   - gpt-oss-120b: 1.2s, perfect JSON, OpenAI Responses API shape
+ *   - gpt-oss-20b: 0.85s, perfect JSON, same shape
+ *   - llama-4-scout: 0.9s, JSON wrapped in ```...```, classic Workers AI shape
+ *
+ * Removed (broken on Workers AI as of 2026-04-18):
+ *   - kimi-k2.5: returns empty response after 12s
+ *   - deepseek-r1-distill-qwen-32b: returns think-aloud, not JSON
+ *   - qwen2.5-coder-32b: malformed response object
  */
 const STRATEGIST_MODELS = [
-  { id: '@cf/moonshotai/kimi-k2.5', name: 'Kimi K2.5' },
-  { id: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b', name: 'DeepSeek R1 32B' },
-  { id: '@cf/qwen/qwen2.5-coder-32b-instruct', name: 'Qwen 2.5 Coder 32B' },
+  { id: '@cf/openai/gpt-oss-120b', name: 'GPT-OSS 120B' },
+  { id: '@cf/openai/gpt-oss-20b', name: 'GPT-OSS 20B' },
+  { id: '@cf/meta/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout' },
 ];
+
+/** Extract assistant text across the various Workers AI response shapes. */
+function extractText(out: any): string {
+  if (typeof out?.response === 'string') return out.response;
+  if (Array.isArray(out?.choices) && out.choices[0]?.message?.content) return out.choices[0].message.content;
+  if (typeof out?.output_text === 'string') return out.output_text;
+  if (Array.isArray(out?.output) && out.output[0]?.content?.[0]?.text) return out.output[0].content[0].text;
+  return '';
+}
 
 /**
  * Call strategist via Workers AI with model fallback.
@@ -80,7 +98,7 @@ export async function callStrategist(
   for (const model of STRATEGIST_MODELS) {
     const start = Date.now();
     try {
-      const result = await ai.run(model.id, {
+      const result: any = await ai.run(model.id, {
         messages: [
           { role: 'system', content: opts.systemPrompt },
           { role: 'user', content: opts.prompt },
@@ -90,7 +108,7 @@ export async function callStrategist(
       });
 
       const inferenceMs = Date.now() - start;
-      const text = (result.response || '').trim();
+      const text = extractText(result).trim();
 
       // Treat empty response as failure — try next model
       if (!text) {
