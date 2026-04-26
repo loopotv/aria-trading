@@ -169,3 +169,39 @@ CREATE INDEX IF NOT EXISTS idx_news_processed_at ON news_events(processed_at);
 CREATE INDEX IF NOT EXISTS idx_news_category ON news_events(category);
 CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_snapshots(date);
 CREATE INDEX IF NOT EXISTS idx_patterns_asset ON patterns(asset);
+
+-- ============================================================
+-- Step 1 (capital preservation gates): daily loss halt + gate telemetry
+-- ============================================================
+
+-- Daily risk state — one row per UTC date.
+-- equity_start is captured LAZILY at the first check of the UTC day,
+-- NOT at midnight. For a low-frequency bot this is acceptable; the limit
+-- becomes "loss from first activity of the day", not "loss from midnight".
+-- PRIMARY KEY on date_utc makes INSERT OR IGNORE race-safe across isolates.
+CREATE TABLE IF NOT EXISTS daily_risk_state (
+  date_utc TEXT PRIMARY KEY,        -- 'YYYY-MM-DD'
+  equity_start REAL NOT NULL,       -- equity at first observation of the day
+  realized_pnl REAL NOT NULL DEFAULT 0,  -- cumulative realized PnL since equity_start
+  halted INTEGER NOT NULL DEFAULT 0,     -- 0 = trading allowed, 1 = halt new entries
+  initialized_at TEXT NOT NULL DEFAULT (datetime('now')),
+  halted_at TEXT
+);
+
+-- Per-gate decision log. Captures BOTH passed and rejected checks so we can
+-- ex-post reconstruct the funnel and identify redundant gates.
+-- Schema kept minimal — extend in Step 2 only if needed (no speculative columns).
+CREATE TABLE IF NOT EXISTS gate_telemetry (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,           -- ms epoch
+  gate_id TEXT NOT NULL,         -- 'daily_loss', 'funding_long', 'funding_short', 'funding_monitor'
+  asset TEXT,
+  direction TEXT,                -- 'LONG' | 'SHORT' | NULL
+  passed INTEGER NOT NULL,       -- 0 = reject, 1 = pass
+  value REAL,                    -- the measured value (e.g. funding 67.3)
+  threshold REAL,                -- the gate threshold (e.g. 50)
+  reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_telemetry_ts ON gate_telemetry(ts);
+CREATE INDEX IF NOT EXISTS idx_gate_telemetry_gate ON gate_telemetry(gate_id);

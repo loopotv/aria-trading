@@ -34,6 +34,10 @@ type Bindings = {
   AI: AiBinding;
   COSTS: KVNamespace;
   DB: D1Database;
+  // Step 1 — capital preservation gates (string-typed; parsed in getEngine)
+  DAILY_LOSS_LIMIT_PCT?: string;          // default 2.0
+  FUNDING_GATE_THRESHOLD_PCT?: string;    // default 50
+  FUNDING_EMERGENCY_EXIT_PCT?: string;    // default 500
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -521,6 +525,11 @@ function getEngine(env: Bindings): TradingEngine {
     );
 
     const isHyperliquid = (env.EXCHANGE || 'binance').toLowerCase() === 'hyperliquid';
+    // Step 1 — env vars with safe defaults (parseFloat returns NaN if missing/invalid → fallback)
+    const parsePct = (s: string | undefined, def: number): number => {
+      const v = parseFloat(s ?? '');
+      return isFinite(v) && v > 0 ? v : def;
+    };
     const config: EngineConfig = {
       leverage: isHyperliquid ? 3 : 10,
       riskPerTrade: 2,
@@ -528,6 +537,9 @@ function getEngine(env: Bindings): TradingEngine {
       maxPositions: isHyperliquid ? 3 : 6,
       enableEventDriven: true,
       enableMarketNeutral: !isHyperliquid, // Disable for now (no hedge mode)
+      dailyLossLimitPct: parsePct(env.DAILY_LOSS_LIMIT_PCT, 2.0),
+      fundingGateThresholdPct: parsePct(env.FUNDING_GATE_THRESHOLD_PCT, 50),
+      fundingEmergencyExitPct: parsePct(env.FUNDING_EMERGENCY_EXIT_PCT, 500),
     };
 
     if (!env.AI) throw new Error('AI binding required (Workers AI)');

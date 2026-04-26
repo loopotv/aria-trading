@@ -20,6 +20,14 @@ import { detectRegime, RegimeParams, formatRegimeTelegram } from './regime';
 import { ExperienceDB } from './experience';
 import { calculateCompositeScore } from './composite-score';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD } from '../utils/indicators';
+import { logEvent, logError } from '../utils/log';
+import { logGate } from './gate-telemetry';
+import {
+  getOrCreateDailyState,
+  setHalted,
+  isOverDailyLossLimit,
+  addRealizedPnl,
+} from './daily-risk';
 import { costTracker, extractJson } from '../wavespeed/client';
 import type { AiBinding } from '../wavespeed/workers-ai';
 import { callStrategist } from '../wavespeed/workers-ai';
@@ -33,6 +41,10 @@ export interface EngineConfig {
   maxPositions: number;
   enableEventDriven: boolean;
   enableMarketNeutral: boolean;
+  // Step 1 capital preservation gates (defaults applied in index.ts)
+  dailyLossLimitPct?: number;          // default 2.0
+  fundingGateThresholdPct?: number;    // default 50 (used asymmetrically: LONG +X, SHORT -(X-15))
+  fundingEmergencyExitPct?: number;    // default 500
 }
 
 interface SoftOrder {
@@ -515,11 +527,201 @@ export class TradingEngine {
     }
   }
 
+  // ====================================================================
+  // STEP 1 — Capital preservation gates (daily loss + funding)
+  // ====================================================================
+
+  /**
+   * Check if today's UTC daily loss limit has been breached.
+   * Returns { allowed: false } to block NEW entries. Existing positions are
+   * unaffected — checkSoftOrders continues to manage them.
+   *
+   * Fail-safe: if anything goes wrong (no DB, fetch error), returns allowed=true
+   * (do not block on infrastructure issues).
+   */
+  private async checkDailyLossLimit(): Promise<{ allowed: boolean; lossPct?: number }> {
+    if (!this.experience) return { allowed: true };
+    const db = this.experience.getDb();
+    if (!db) return { allowed: true };
+
+    const limitPct = this.config.dailyLossLimitPct ?? 2.0;
+
+    try {
+      const account = await this.getAccount();
+      const equity = parseFloat(account.totalWalletBalance) + parseFloat(account.totalUnrealizedProfit || '0');
+
+      const state = await getOrCreateDailyState(db, equity);
+      if (!state) return { allowed: true }; // fail-safe: DB write failed, do not block
+
+      // Already halted earlier today
+      if (state.halted) {
+        await logGate(db, {
+          gateId: 'daily_loss',
+          passed: false,
+          value: ((equity - state.equityStart) / state.equityStart) * 100,
+          threshold: -limitPct,
+          reason: 'DAILY_LOSS_HALT (already halted)',
+        });
+        return { allowed: false };
+      }
+
+      const { halted, lossPct } = isOverDailyLossLimit(state, equity, limitPct);
+      if (halted) {
+        await setHalted(db);
+        logEvent('daily_loss_limit_breached', {
+          equity_start: state.equityStart,
+          equity_now: equity,
+          loss_pct: lossPct,
+          limit_pct: limitPct,
+        });
+        await this.telegram.sendMessage(
+          `🛑 <b>DAILY LOSS HALT</b>\n\n` +
+          `Equity start: $${state.equityStart.toFixed(2)}\n` +
+          `Equity now: $${equity.toFixed(2)}\n` +
+          `Loss: ${lossPct.toFixed(2)}% (limit -${limitPct}%)\n\n` +
+          `New entries blocked until 00:00 UTC. Existing positions unaffected.`
+        );
+        await logGate(db, {
+          gateId: 'daily_loss',
+          passed: false,
+          value: lossPct,
+          threshold: -limitPct,
+          reason: 'DAILY_LOSS_HALT (newly triggered)',
+        });
+        return { allowed: false, lossPct };
+      }
+
+      await logGate(db, {
+        gateId: 'daily_loss',
+        passed: true,
+        value: lossPct,
+        threshold: -limitPct,
+      });
+      return { allowed: true, lossPct };
+    } catch (err) {
+      logError('daily_loss_check_failed', err);
+      return { allowed: true }; // fail-safe
+    }
+  }
+
+  /**
+   * Funding-rate entry gate. Asymmetric thresholds account for the ~11.6% APR
+   * baseline that LONGs structurally pay on Hyperliquid:
+   *   - LONG threshold:  +X% APR  (default +50)
+   *   - SHORT threshold: -(X-15)% APR  (default -35)
+   * The 15% offset normalizes the "real cost above baseline" between sides.
+   *
+   * Fail-safe: if funding fetch fails or exchange doesn't expose it, allow trade.
+   */
+  private async checkFundingGate(
+    asset: string,
+    direction: 'LONG' | 'SHORT',
+  ): Promise<{ allowed: boolean; fundingAnnualPct?: number }> {
+    if (!this.exchange.getFundingRate) return { allowed: true };
+    const db = this.experience?.getDb();
+
+    let funding: number | null;
+    try {
+      funding = await this.exchange.getFundingRate(asset);
+    } catch (err) {
+      logError('funding_fetch_failed', err, { asset });
+      return { allowed: true };
+    }
+    if (funding == null) return { allowed: true };
+
+    const fundingAnnualPct = funding * 24 * 365 * 100;
+    const baseThr = this.config.fundingGateThresholdPct ?? 50;
+    const longThr = baseThr;          // e.g. +50
+    const shortThr = -(baseThr - 15); // e.g. -35
+
+    // Extreme funding alert (>500% absolute) — log but does not by itself reject
+    if (Math.abs(fundingAnnualPct) > 500) {
+      logEvent('extreme_funding_detected', { asset, funding_annual_pct: fundingAnnualPct, funding_hourly: funding });
+    }
+
+    const gateId = direction === 'LONG' ? 'funding_long' : 'funding_short';
+    if (direction === 'LONG' && fundingAnnualPct > longThr) {
+      logEvent('funding_gate_reject', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: longThr });
+      await logGate(db, {
+        gateId, asset, direction, passed: false,
+        value: fundingAnnualPct, threshold: longThr,
+        reason: 'FUNDING_TOO_HIGH_LONG',
+      });
+      return { allowed: false, fundingAnnualPct };
+    }
+    if (direction === 'SHORT' && fundingAnnualPct < shortThr) {
+      logEvent('funding_gate_reject', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: shortThr });
+      await logGate(db, {
+        gateId, asset, direction, passed: false,
+        value: fundingAnnualPct, threshold: shortThr,
+        reason: 'FUNDING_TOO_LOW_SHORT',
+      });
+      return { allowed: false, fundingAnnualPct };
+    }
+
+    await logGate(db, {
+      gateId, asset, direction, passed: true,
+      value: fundingAnnualPct,
+      threshold: direction === 'LONG' ? longThr : shortThr,
+    });
+    return { allowed: true, fundingAnnualPct };
+  }
+
+  /**
+   * Mid-trade emergency funding exit. Returns true if the position must be force-closed.
+   * Fail-safe: on fetch error, returns false (no action) — never close on missing data.
+   * Always logs to gate_telemetry as 'funding_monitor' (passed=true if no exit).
+   */
+  private async checkEmergencyFundingExit(
+    asset: string,
+    direction: 'LONG' | 'SHORT',
+  ): Promise<{ exit: boolean; fundingAnnualPct?: number }> {
+    if (!this.exchange.getFundingRate) return { exit: false };
+    const db = this.experience?.getDb();
+
+    let funding: number | null;
+    try {
+      funding = await this.exchange.getFundingRate(asset);
+    } catch (err) {
+      logError('funding_monitor_fetch_failed', err, { asset });
+      return { exit: false }; // fail-safe: never force-close on missing data
+    }
+    if (funding == null) return { exit: false };
+
+    const fundingAnnualPct = funding * 24 * 365 * 100;
+    const emergencyThr = this.config.fundingEmergencyExitPct ?? 500;
+
+    const triggered = (direction === 'LONG' && fundingAnnualPct > emergencyThr) ||
+                      (direction === 'SHORT' && fundingAnnualPct < -emergencyThr);
+
+    await logGate(db, {
+      gateId: 'funding_monitor',
+      asset,
+      direction,
+      passed: !triggered,
+      value: fundingAnnualPct,
+      threshold: direction === 'LONG' ? emergencyThr : -emergencyThr,
+      reason: triggered ? 'EMERGENCY_FUNDING_EXIT' : null,
+    });
+
+    if (triggered) {
+      logEvent('emergency_funding_exit_triggered', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: emergencyThr });
+    }
+    return { exit: triggered, fundingAnnualPct };
+  }
+
   /**
    * Process a high-impact event through the full pipeline.
    */
   private async processEventDriven(item: RawTextItem): Promise<void> {
     console.log(`[Event] Processing: ${item.text.slice(0, 80)}...`);
+
+    // STEP 1.1 — Daily loss limit check (fail-fast, blocks all NEW entries).
+    const dailyCheck = await this.checkDailyLossLimit();
+    if (!dailyCheck.allowed) {
+      console.log(`[Event] DAILY_LOSS_HALT — new entries blocked${dailyCheck.lossPct != null ? ` (loss ${dailyCheck.lossPct.toFixed(2)}%)` : ''}`);
+      return;
+    }
 
     // Pre-identify asset to fetch price context before the LLM call (Sprint 1A).
     const preAsset = this.quickIdentifyAsset(item);
@@ -633,6 +835,23 @@ export class TradingEngine {
     // Blocca SHORT in F&G<35 (lascia LONG passare).
     if (setup.direction === 'SHORT' && this.lastFearGreed < 35) {
       const reason = `SHORT blocked in EXTREME_FEAR (F&G=${this.lastFearGreed}, LONG-favored regime)`;
+      console.log(`[Event] ${reason}`);
+      await this.telegram.notifyEvent({
+        asset: signal.asset,
+        sentiment: signal.sentimentScore,
+        magnitude: signal.magnitude,
+        headline: item.text.slice(0, 200),
+        action: `SKIP: ${reason}`,
+      });
+      return;
+    }
+
+    // ---- STEP 1.2 — Funding rate entry gate ----
+    // Asymmetric thresholds: LONG +50% APR, SHORT -35% APR (15% offset accounts
+    // for the ~11.6% APR baseline that LONGs structurally pay on Hyperliquid).
+    const fundingCheck = await this.checkFundingGate(signal.asset, setup.direction);
+    if (!fundingCheck.allowed) {
+      const reason = `Funding ${setup.direction === 'LONG' ? 'too high' : 'too low'} (${fundingCheck.fundingAnnualPct?.toFixed(0)}% APR)`;
       console.log(`[Event] ${reason}`);
       await this.telegram.notifyEvent({
         asset: signal.asset,
@@ -1250,6 +1469,9 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           try {
             await this.experience.recordTradeClose(order.symbol, order.direction, exitPrice, realizedPnl);
             console.log(`[SoftSL/TP] Recorded external close: ${order.symbol} ${order.direction} pnl=$${realizedPnl.toFixed(4)}`);
+            // Step 1.1: feed realized PnL into daily risk state for halt accounting.
+            const db = this.experience.getDb();
+            if (db) await addRealizedPnl(db, realizedPnl);
           } catch (e) {
             console.warn(`[SoftSL/TP] Failed to record close: ${(e as Error).message?.slice(0, 80)}`);
           }
@@ -1289,11 +1511,30 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       let shouldClose = false;
       let reason = '';
 
+      // STEP 1.3 — Emergency funding exit (highest priority).
+      // Strips asset prefix from symbol: 'BTCUSDT' -> 'BTC' for Hyperliquid funding lookup.
+      // Note: this MUST run even when daily_loss HALT is active — it's an exit, not entry.
+      const assetForFunding = order.symbol.endsWith('USDT')
+        ? order.symbol.slice(0, -4)
+        : order.symbol;
+      const emergencyCheck = await this.checkEmergencyFundingExit(assetForFunding, order.direction);
+      if (emergencyCheck.exit) {
+        shouldClose = true;
+        reason = `🚨 EMERGENCY funding (${emergencyCheck.fundingAnnualPct?.toFixed(0)}% APR > threshold)`;
+        await this.telegram.sendMessage(
+          `🚨 <b>EMERGENCY FUNDING EXIT</b>\n\n` +
+          `<b>${order.direction} ${order.symbol}</b>\n` +
+          `Funding: <code>${emergencyCheck.fundingAnnualPct?.toFixed(0)}% APR</code>\n` +
+          `PnL at exit: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>\n` +
+          `Force-closing now (funding extreme, position economically unsustainable).`
+        );
+      }
+
       // Trend-reversal early-exit (Sprint 1 follow-up):
       // If position is in profit AND held >60min AND 2/3 trend signals have flipped, close now.
       // Protects winners from decaying back to break-even at the 4h timeout.
       const heldMin = (Date.now() - order.openedAt) / 60000;
-      if (pnl > 0 && heldMin >= 60) {
+      if (!shouldClose && pnl > 0 && heldMin >= 60) {
         const reversal = await this.checkTrendReversal(order.symbol, order.direction, currentPrice);
 
         // Telemetry: record every check so we can verify the gate is alive
@@ -1373,6 +1614,9 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
             try {
               await this.experience.recordTradeClose(order.symbol, order.direction, currentPrice, pnl);
               console.log(`[Experience] Trade close recorded: ${order.symbol} P&L=$${pnl.toFixed(2)}`);
+              // Step 1.1: feed realized PnL into daily risk state for halt accounting.
+              const db = this.experience.getDb();
+              if (db) await addRealizedPnl(db, pnl);
             } catch (expErr) {
               console.warn(`[Experience] Close save failed: ${(expErr as Error).message?.slice(0, 80)}`);
             }

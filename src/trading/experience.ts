@@ -43,6 +43,9 @@ export interface NewsEventRecord {
 export class ExperienceDB {
   constructor(private db: D1Database) {}
 
+  /** Internal accessor for cross-module DB use (daily-risk, gate-telemetry). */
+  getDb(): D1Database { return this.db; }
+
   // ---- TRADES ----
 
   async recordTradeOpen(trade: TradeContext): Promise<number> {

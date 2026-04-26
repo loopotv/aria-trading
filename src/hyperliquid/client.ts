@@ -503,4 +503,55 @@ export class HyperliquidClient implements IExchange {
   async getAllUserTrades(limit?: number): Promise<any[]> {
     return this.getUserTrades(undefined, limit);
   }
+
+  /**
+   * Fetch current hourly funding rate for an asset (e.g. "BTC", "ETH").
+   * Hyperliquid pays funding hourly. Returns the raw hourly rate (decimal),
+   * e.g. 0.0000125 = 0.00125%/hour ≈ 11% APR.
+   *
+   * Uses Cloudflare Cache API for cross-isolate caching (5min TTL). Falls back
+   * to direct fetch if cache fails. Returns null on any unrecoverable error
+   * — the caller MUST treat null as "unknown, do not act" (fail-safe).
+   */
+  async getFundingRate(asset: string): Promise<number | null> {
+    const cacheKey = `https://aria-internal.cache/funding/${asset}`;
+    const cache = (caches as any).default as Cache | undefined;
+
+    if (cache) {
+      try {
+        const cached = await cache.match(cacheKey);
+        if (cached) {
+          const json = await cached.json() as { funding: number };
+          return json.funding;
+        }
+      } catch { /* fall through to fetch */ }
+    }
+
+    try {
+      // metaAndAssetCtxs returns [universe, ctxs[]]. We need ctx with name=asset.
+      const data = await this.infoPost<any>({ type: 'metaAndAssetCtxs' });
+      if (!Array.isArray(data) || data.length < 2) return null;
+      const universe: any[] = data[0]?.universe || [];
+      const ctxs: any[] = data[1] || [];
+      const idx = universe.findIndex(u => u?.name === asset);
+      if (idx < 0 || !ctxs[idx]) return null;
+      const fundingStr = ctxs[idx].funding;
+      if (fundingStr == null) return null;
+      const funding = parseFloat(fundingStr);
+      if (!isFinite(funding)) return null;
+
+      if (cache) {
+        try {
+          const resp = new Response(JSON.stringify({ funding }), {
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=300' },
+          });
+          await cache.put(cacheKey, resp);
+        } catch { /* cache write best-effort */ }
+      }
+
+      return funding;
+    } catch {
+      return null;
+    }
+  }
 }

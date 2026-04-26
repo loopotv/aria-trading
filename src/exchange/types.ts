@@ -91,6 +91,8 @@ export interface IExchange {
   getPrice(symbol: string): Promise<number>;
   getKlines(symbol: string, interval: string, limit: number): Promise<number[][]>;
   getTicker24hr(symbol: string): Promise<Ticker24hr>;
+  /** Returns hourly funding rate as decimal (e.g. 0.0000125 = 0.00125%/h), or null if unknown/unsupported. */
+  getFundingRate?(asset: string): Promise<number | null>;
 
   // --- Account ---
   getAccountInfo(): Promise<AccountInfo>;
