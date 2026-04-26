@@ -816,6 +816,24 @@ export class TradingEngine {
     // Quant filter
     const setup = evaluateEventSignal(signal, highs, lows, closes, volumes, currentPrice);
 
+    // Flush per-gate telemetry from the quant filter (Step 2 prep).
+    // Direction known only if a sentiment-direction check was reached.
+    const dirForLog: 'LONG' | 'SHORT' | null = setup.gateChecks.length >= 4 ? setup.direction : null;
+    const dbForGates = this.experience?.getDb();
+    if (dbForGates) {
+      for (const g of setup.gateChecks) {
+        await logGate(dbForGates, {
+          gateId: g.gateId,
+          asset: signal.asset,
+          direction: dirForLog,
+          passed: g.passed,
+          value: g.value,
+          threshold: g.threshold,
+          reason: g.reason,
+        });
+      }
+    }
+
     await this.telegram.notifyEvent({
       asset: signal.asset,
       sentiment: signal.sentimentScore,
@@ -836,6 +854,13 @@ export class TradingEngine {
     if (setup.direction === 'SHORT' && this.lastFearGreed < 35) {
       const reason = `SHORT blocked in EXTREME_FEAR (F&G=${this.lastFearGreed}, LONG-favored regime)`;
       console.log(`[Event] ${reason}`);
+      if (dbForGates) {
+        await logGate(dbForGates, {
+          gateId: 'fg_short_block', asset: signal.asset, direction: 'SHORT',
+          passed: false, value: this.lastFearGreed, threshold: 35,
+          reason: 'fg_extreme_fear_short_blocked',
+        });
+      }
       await this.telegram.notifyEvent({
         asset: signal.asset,
         sentiment: signal.sentimentScore,
@@ -844,6 +869,13 @@ export class TradingEngine {
         action: `SKIP: ${reason}`,
       });
       return;
+    }
+    // Log F&G pass for both directions
+    if (dbForGates) {
+      await logGate(dbForGates, {
+        gateId: 'fg_short_block', asset: signal.asset, direction: setup.direction,
+        passed: true, value: this.lastFearGreed, threshold: 35,
+      });
     }
 
     // ---- STEP 1.2 — Funding rate entry gate ----
@@ -875,6 +907,18 @@ export class TradingEngine {
       `Vol:${composite.breakdown.volatility} Trend:${composite.breakdown.trend} ` +
       `Reg:${composite.breakdown.regime}) size=${composite.sizeMultiplier}x`);
 
+    if (dbForGates) {
+      await logGate(dbForGates, {
+        gateId: 'composite_score',
+        asset: signal.asset,
+        direction: setup.direction,
+        passed: composite.approved,
+        value: composite.score,
+        threshold: 60,
+        reason: composite.approved ? null : 'composite_below_threshold',
+      });
+    }
+
     if (!composite.approved) {
       console.log(`[Composite] REJECTED: ${composite.reason}`);
       await this.telegram.notifyEvent({
@@ -882,7 +926,7 @@ export class TradingEngine {
         sentiment: signal.sentimentScore,
         magnitude: signal.magnitude,
         headline: item.text.slice(0, 200),
-        action: `SKIP: Composite ${composite.score}/100 (min 40)`,
+        action: `SKIP: Composite ${composite.score}/100 (min 60)`,
       });
       return;
     }
@@ -1019,6 +1063,18 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
             `Trade NOT executed`
           );
           return;
+        }
+
+        if (dbForGates) {
+          await logGate(dbForGates, {
+            gateId: 'strategist_llm',
+            asset: signal.asset,
+            direction: setup.direction,
+            passed: !!decision.execute,
+            value: decision.riskScore ?? null,
+            threshold: null,
+            reason: decision.execute ? null : (decision.reasoning?.slice(0, 100) ?? 'rejected'),
+          });
         }
 
         if (!decision.execute) {

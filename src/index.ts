@@ -94,6 +94,29 @@ app.get('/account', async (c) => {
   }
 });
 
+// Gate telemetry — aggregate counts per gate over the last N hours (default 24).
+// Used to identify redundant gates and calibrate thresholds (Step 2 prep).
+app.get('/debug/gate-stats', async (c) => {
+  if (!c.env.DB) return c.json({ error: 'DB not configured' }, 500);
+  const hours = parseInt(c.req.query('hours') || '24');
+  const sinceMs = Date.now() - hours * 3600 * 1000;
+  const rows = await c.env.DB.prepare(
+    `SELECT gate_id, direction, passed, COUNT(*) as n,
+            ROUND(AVG(value), 3) as avg_value,
+            ROUND(MIN(value), 3) as min_value,
+            ROUND(MAX(value), 3) as max_value
+     FROM gate_telemetry
+     WHERE ts > ?
+     GROUP BY gate_id, direction, passed
+     ORDER BY gate_id, direction, passed DESC`
+  ).bind(sinceMs).all();
+  return c.json({
+    window_hours: hours,
+    since_iso: new Date(sinceMs).toISOString(),
+    stats: rows.results,
+  });
+});
+
 // Trend-reversal telemetry — see if/when the early-exit gate is firing.
 // Resets on deploy. Returns last 50 checks (both flipped=true and false).
 app.get('/debug/reversals', (c) => {

@@ -41,6 +41,17 @@ export interface EventTradeSetup {
     atr: number;
     volumeRatio: number;
   };
+  /**
+   * Per-gate checks captured during evaluation. Engine writes these to gate_telemetry
+   * after the call. First failed gate (passed=false) marks where evaluation stopped.
+   */
+  gateChecks: Array<{
+    gateId: string;
+    passed: boolean;
+    value: number | null;
+    threshold: number | null;
+    reason: string | null;
+  }>;
 }
 
 /**
@@ -66,80 +77,101 @@ export function evaluateEventSignal(
   const volumeRatio = avgVol > 0 ? recentVol / avgVol : 1;
   const indicators = { rsi, adx: adxRes.adx, atr, volumeRatio };
 
+  const checks: EventTradeSetup['gateChecks'] = [];
+  const passCheck = (gateId: string, value: number | null, threshold: number | null) =>
+    checks.push({ gateId, passed: true, value, threshold, reason: null });
+  const failCheck = (gateId: string, value: number | null, threshold: number | null, reason: string) =>
+    checks.push({ gateId, passed: false, value, threshold, reason });
+
   // --- Gate 1: Magnitude threshold ---
   if (signal.magnitude < 0.5) {
-    return reject(symbol, 'Magnitude too low (<0.5)', indicators);
+    failCheck('magnitude', signal.magnitude, 0.5, 'magnitude_low');
+    return reject(symbol, 'Magnitude too low (<0.5)', indicators, checks);
   }
+  passCheck('magnitude', signal.magnitude, 0.5);
 
   // --- Gate 2: Confidence threshold ---
   if (signal.confidence < 0.7) {
-    return reject(symbol, 'Confidence too low (<0.7)', indicators);
+    failCheck('confidence', signal.confidence, 0.7, 'confidence_low');
+    return reject(symbol, 'Confidence too low (<0.7)', indicators, checks);
   }
+  passCheck('confidence', signal.confidence, 0.7);
 
   // --- Gate 3: Sentiment must have clear direction ---
-  if (Math.abs(signal.sentimentScore) < 0.3) {
-    return reject(symbol, 'Sentiment too neutral (|score| < 0.3)', indicators);
+  const absScore = Math.abs(signal.sentimentScore);
+  if (absScore < 0.3) {
+    failCheck('sentiment_clear', absScore, 0.3, 'sentiment_neutral');
+    return reject(symbol, 'Sentiment too neutral (|score| < 0.3)', indicators, checks);
   }
+  passCheck('sentiment_clear', absScore, 0.3);
 
   const direction: 'LONG' | 'SHORT' =
     signal.sentimentScore > 0 ? 'LONG' : 'SHORT';
 
   // --- Gate 4: RSI not at extreme in trade direction ---
   if (direction === 'LONG' && rsi > 75) {
-    return reject(symbol, `RSI too high for LONG (${rsi.toFixed(0)})`, indicators);
+    failCheck('rsi_extreme', rsi, 75, 'rsi_too_high_for_long');
+    return reject(symbol, `RSI too high for LONG (${rsi.toFixed(0)})`, indicators, checks);
   }
   if (direction === 'SHORT' && rsi < 25) {
-    return reject(symbol, `RSI too low for SHORT (${rsi.toFixed(0)})`, indicators);
+    failCheck('rsi_extreme', rsi, 25, 'rsi_too_low_for_short');
+    return reject(symbol, `RSI too low for SHORT (${rsi.toFixed(0)})`, indicators, checks);
   }
+  passCheck('rsi_extreme', rsi, direction === 'LONG' ? 75 : 25);
 
   // --- Gate 5: Price hasn't already moved too much ---
-  // Check if price moved >6% in the last 3 candles (event already priced in)
+  let recentMovePct = 0;
   if (closes.length >= 4) {
     const recentMove = Math.abs(
       (closes[closes.length - 1] - closes[closes.length - 4]) / closes[closes.length - 4]
     );
+    recentMovePct = recentMove * 100;
     if (recentMove > 0.06) {
-      return reject(symbol, `Price already moved ${(recentMove * 100).toFixed(1)}% (>6%)`, indicators);
+      failCheck('move_recent', recentMovePct, 6, 'price_already_moved');
+      return reject(symbol, `Price already moved ${recentMovePct.toFixed(1)}% (>6%)`, indicators, checks);
     }
   }
+  passCheck('move_recent', recentMovePct, 6);
 
   // --- Gate 6: RSI direction-momentum gate (Sprint 2A) ---
-  // Data 2026-04-19→24 (58 trade): SHORT con RSI 35-45 = WR 33% / -$0.65 (15 trade).
-  //                                LONG  con RSI 35-45 = WR 0%  / -$0.20 (2 trade).
-  // Estendo anti-bounce SHORT: RSI<45 → block. Aggiungo pro-momentum LONG: RSI<45 → block.
   if (direction === 'SHORT' && rsi < 45) {
-    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥45 for clean downtrend)`, indicators);
+    failCheck('rsi_momentum_short', rsi, 45, 'rsi_too_low_for_short_momentum');
+    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥45 for clean downtrend)`, indicators, checks);
   }
   if (direction === 'LONG' && rsi < 45) {
-    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥45 for trend confirmation)`, indicators);
+    failCheck('rsi_momentum_long', rsi, 45, 'rsi_too_low_for_long_momentum');
+    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥45 for trend confirmation)`, indicators, checks);
   }
+  passCheck(direction === 'LONG' ? 'rsi_momentum_long' : 'rsi_momentum_short', rsi, 45);
+
+  // --- Gate 6c: SHORT volume (panic-sell) ---
   if (direction === 'SHORT' && volumeRatio < 0.5) {
-    return reject(symbol, `Anti-bounce: SHORT blocked, vol=${volumeRatio.toFixed(2)}x (no panic-sell)`, indicators);
+    failCheck('vol_short', volumeRatio, 0.5, 'no_panic_sell');
+    return reject(symbol, `Anti-bounce: SHORT blocked, vol=${volumeRatio.toFixed(2)}x (no panic-sell)`, indicators, checks);
   }
+  if (direction === 'SHORT') passCheck('vol_short', volumeRatio, 0.5);
 
   // --- Gate 7: LONG buying-pressure (Sprint 2B) ---
-  // Data 25/04: 2 BTC LONG aperti con vol 0.53 e 0.70 → entrambi timeout perdita.
-  // Senza domanda confermata, i LONG su news positive si afflosciano.
-  // Soglia 0.7 (più permissiva del SHORT 0.5) — i LONG hanno più bisogno di buying pressure.
   if (direction === 'LONG' && volumeRatio < 0.7) {
-    return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (no buying pressure, need ≥0.7)`, indicators);
+    failCheck('vol_long', volumeRatio, 0.7, 'no_buying_pressure');
+    return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (no buying pressure, need ≥0.7)`, indicators, checks);
   }
+  if (direction === 'LONG') passCheck('vol_long', volumeRatio, 0.7);
 
   // --- Gate 8: ADX minimo — serve un trend confermato (Sprint 2B) ---
-  // Data 25/04: BTC LONG con ADX 9.6 e 18.6 → mercato range, TP irraggiungibile.
-  // ADX <18 = trend troppo debole/inesistente per un trade event-driven a 4h.
   if (adxRes.adx < 18) {
-    return reject(symbol, `Trend troppo debole (ADX=${adxRes.adx.toFixed(0)}<18, mercato range)`, indicators);
+    failCheck('adx_min', adxRes.adx, 18, 'trend_too_weak');
+    return reject(symbol, `Trend troppo debole (ADX=${adxRes.adx.toFixed(0)}<18, mercato range)`, indicators, checks);
   }
+  passCheck('adx_min', adxRes.adx, 18);
 
   // --- Gate 9: ATR% minimo — serve volatilità sufficiente per il TP (Sprint 2B) ---
-  // Data 25/04: BTC LONG con ATR 0.22% e 0.24% → TP a 1.8x ATR ≈ 0.43% movimento.
-  // In 4h con mercato piatto BTC non fa 0.43%, quindi timeout garantito.
-  // Soglia 0.4% perché TP 1.8x ATR = 0.72% movimento richiesto, ragionevole in 4h.
   const atrPct = (atr / currentPrice) * 100;
   if (atrPct < 0.4) {
-    return reject(symbol, `Volatilità insufficiente (ATR=${atrPct.toFixed(2)}%<0.4%, TP irraggiungibile in 4h)`, indicators);
+    failCheck('atr_min', atrPct, 0.4, 'volatility_insufficient');
+    return reject(symbol, `Volatilità insufficiente (ATR=${atrPct.toFixed(2)}%<0.4%, TP irraggiungibile in 4h)`, indicators, checks);
   }
+  passCheck('atr_min', atrPct, 0.4);
 
   // --- Gate 10: Trend alignment (bonus, not required) ---
   const ema20 = calculateEMA(closes, 20);
@@ -190,6 +222,7 @@ export function evaluateEventSignal(
     atr,
     timeoutHours: 4, // Close after 4 hours if no SL/TP (was 2h — too short for TP to hit)
     indicators,
+    gateChecks: checks,
   };
 }
 
@@ -197,6 +230,7 @@ function reject(
   symbol: string,
   reason: string,
   indicators: { rsi: number; adx: number; atr: number; volumeRatio: number },
+  gateChecks: EventTradeSetup['gateChecks'] = [],
 ): EventTradeSetup {
   return {
     approved: false,
@@ -210,5 +244,6 @@ function reject(
     atr: 0,
     timeoutHours: 0,
     indicators,
+    gateChecks,
   };
 }
