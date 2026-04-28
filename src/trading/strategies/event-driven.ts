@@ -3,18 +3,21 @@
  *
  * Flow: News event detected → LLM classifies → Quant filter confirms → Trade
  *
- * Key rules:
+ * Key rules (after mini-Step 2 round 2, 2026-04-27):
  * 1. Only trade HIGH magnitude events (>0.5)
  * 2. LLM must have HIGH confidence (>0.7)
  * 3. Sentiment direction clear (|score| > 0.3)
- * 4. Recent move <3% (was 6% — tightened after telemetry showed 6% never fires)
- * 5. RSI momentum gate (Sprint 2A): SHORT/LONG require RSI≥45 — also subsumes
- *    the old extreme-RSI gate (removed: 0 fires in 24h of telemetry)
- * 6. Volume gates: SHORT vol≥0.5 (panic-sell), LONG vol≥0.7 (buying pressure)
- * 7. Trend confirmation (Sprint 2B): ADX≥18 — no range markets
- * 8. Volatility gate (Sprint 2B): ATR%≥0.4% — TP must be reachable in 4h
- * 9. Execute within 60 seconds of event detection
- * 10. Tight SL (1.5x ATR), TP 1.8x ATR — realistic for 4h holding
+ * 4. RSI momentum gate: SHORT/LONG require RSI≥42 (lowered from 45 — telemetry
+ *    showed 82% reject rate at 45)
+ * 5. Volume gates: SHORT vol≥0.5 (panic-sell), LONG vol≥0.7 (buying pressure)
+ * 6. Trend confirmation: ADX≥18 — no range markets
+ * 7. Volatility gate: ATR%≥0.4% — TP must be reachable in 4h
+ * 8. Execute within 60 seconds of event detection
+ * 9. Tight SL (1.5x ATR), TP 1.8x ATR — realistic for 4h holding
+ *
+ * Removed gates (telemetry showed 0 effective filtering):
+ *   - rsi_extreme (LONG>75, SHORT<25): subsumed by RSI momentum
+ *   - move_recent (>3%, originally >6%): never triggered in production data
  */
 
 import { SentimentSignal } from '../../sentiment/types';
@@ -46,9 +49,11 @@ export interface EventTradeSetup {
   /**
    * Per-gate checks captured during evaluation. Engine writes these to gate_telemetry
    * after the call. First failed gate (passed=false) marks where evaluation stopped.
+   * `direction` is captured at the moment of the check (null for pre-direction gates).
    */
   gateChecks: Array<{
     gateId: string;
+    direction: 'LONG' | 'SHORT' | null;
     passed: boolean;
     value: number | null;
     threshold: number | null;
@@ -80,10 +85,13 @@ export function evaluateEventSignal(
   const indicators = { rsi, adx: adxRes.adx, atr, volumeRatio };
 
   const checks: EventTradeSetup['gateChecks'] = [];
+  // dirRef: mutable holder so the helpers see the current direction without re-creating closures.
+  // Pre-direction gates (G1-G3) log with direction=null; later gates log with the resolved direction.
+  const dirRef: { current: 'LONG' | 'SHORT' | null } = { current: null };
   const passCheck = (gateId: string, value: number | null, threshold: number | null) =>
-    checks.push({ gateId, passed: true, value, threshold, reason: null });
+    checks.push({ gateId, direction: dirRef.current, passed: true, value, threshold, reason: null });
   const failCheck = (gateId: string, value: number | null, threshold: number | null, reason: string) =>
-    checks.push({ gateId, passed: false, value, threshold, reason });
+    checks.push({ gateId, direction: dirRef.current, passed: false, value, threshold, reason });
 
   // --- Gate 1: Magnitude threshold ---
   if (signal.magnitude < 0.5) {
@@ -109,37 +117,28 @@ export function evaluateEventSignal(
 
   const direction: 'LONG' | 'SHORT' =
     signal.sentimentScore > 0 ? 'LONG' : 'SHORT';
+  dirRef.current = direction;
 
   // Gate 4 (rsi_extreme) REMOVED 2026-04-27 — telemetry showed 0/24 reject in 24h.
   // The extreme bands (LONG>75, SHORT<25) are fully subsumed by G6 (rsi_momentum ≥45),
   // which blocks both falling-knife LONG and oversold SHORT in a single check.
 
-  // --- Gate 5: Price hasn't already moved too much ---
-  // Tightened 2026-04-27: 6% → 3% (telemetry showed avg 0.7%, max 1.76% in 24h
-  // — 6% threshold was never hit; 3% still permissive, captures genuine spikes).
-  let recentMovePct = 0;
-  if (closes.length >= 4) {
-    const recentMove = Math.abs(
-      (closes[closes.length - 1] - closes[closes.length - 4]) / closes[closes.length - 4]
-    );
-    recentMovePct = recentMove * 100;
-    if (recentMove > 0.03) {
-      failCheck('move_recent', recentMovePct, 3, 'price_already_moved');
-      return reject(symbol, `Price already moved ${recentMovePct.toFixed(1)}% (>3%)`, indicators, checks);
-    }
-  }
-  passCheck('move_recent', recentMovePct, 3);
+  // Gate 5 (move_recent) REMOVED 2026-04-27 — 0/65 reject in 24h after lowering to 3%.
+  // Avg observed 0.44%, max 1.46%. Even 3% threshold never fires; the gate is dead.
+  // If we ever need anti-chasing protection again, pair with sentiment freshness check.
 
-  // --- Gate 6: RSI direction-momentum gate (Sprint 2A) ---
-  if (direction === 'SHORT' && rsi < 45) {
-    failCheck('rsi_momentum_short', rsi, 45, 'rsi_too_low_for_short_momentum');
-    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥45 for clean downtrend)`, indicators, checks);
+  // --- Gate 6: RSI direction-momentum gate (Sprint 2A, lowered 45→42 on 2026-04-27) ---
+  // Telemetry: 82% reject rate at 45 (avg rejected RSI=37). Lowering to 42 trades off
+  // a few more false positives for ~25% more trade flow. Keep monitoring outcomes.
+  if (direction === 'SHORT' && rsi < 42) {
+    failCheck('rsi_momentum_short', rsi, 42, 'rsi_too_low_for_short_momentum');
+    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥42 for clean downtrend)`, indicators, checks);
   }
-  if (direction === 'LONG' && rsi < 45) {
-    failCheck('rsi_momentum_long', rsi, 45, 'rsi_too_low_for_long_momentum');
-    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥45 for trend confirmation)`, indicators, checks);
+  if (direction === 'LONG' && rsi < 42) {
+    failCheck('rsi_momentum_long', rsi, 42, 'rsi_too_low_for_long_momentum');
+    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥42 for trend confirmation)`, indicators, checks);
   }
-  passCheck(direction === 'LONG' ? 'rsi_momentum_long' : 'rsi_momentum_short', rsi, 45);
+  passCheck(direction === 'LONG' ? 'rsi_momentum_long' : 'rsi_momentum_short', rsi, 42);
 
   // --- Gate 6c: SHORT volume (panic-sell) ---
   if (direction === 'SHORT' && volumeRatio < 0.5) {

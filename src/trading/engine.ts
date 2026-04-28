@@ -817,15 +817,14 @@ export class TradingEngine {
     const setup = evaluateEventSignal(signal, highs, lows, closes, volumes, currentPrice);
 
     // Flush per-gate telemetry from the quant filter (Step 2 prep).
-    // Direction known only if a sentiment-direction check was reached.
-    const dirForLog: 'LONG' | 'SHORT' | null = setup.gateChecks.length >= 4 ? setup.direction : null;
+    // Each GateCheck carries its own direction (null for pre-direction gates G1-G3).
     const dbForGates = this.experience?.getDb();
     if (dbForGates) {
       for (const g of setup.gateChecks) {
         await logGate(dbForGates, {
           gateId: g.gateId,
           asset: signal.asset,
-          direction: dirForLog,
+          direction: g.direction,
           passed: g.passed,
           value: g.value,
           threshold: g.threshold,
