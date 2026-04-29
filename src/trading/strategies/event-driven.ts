@@ -3,21 +3,22 @@
  *
  * Flow: News event detected → LLM classifies → Quant filter confirms → Trade
  *
- * Key rules (after mini-Step 2 round 2, 2026-04-27):
+ * Key rules (after mini-Step 2 round 3, 2026-04-29):
  * 1. Only trade HIGH magnitude events (>0.5)
  * 2. LLM must have HIGH confidence (>0.7)
  * 3. Sentiment direction clear (|score| > 0.3)
- * 4. RSI momentum gate: SHORT/LONG require RSI≥42 (lowered from 45 — telemetry
- *    showed 82% reject rate at 45)
- * 5. Volume gates: SHORT vol≥0.5 (panic-sell), LONG vol≥0.7 (buying pressure)
- * 6. Trend confirmation: ADX≥18 — no range markets
- * 7. Volatility gate: ATR%≥0.4% — TP must be reachable in 4h
- * 8. Execute within 60 seconds of event detection
- * 9. Tight SL (1.5x ATR), TP 1.8x ATR — realistic for 4h holding
+ * 4. RSI momentum: SHORT/LONG require RSI≥42
+ * 5. Volume gates: SHORT vol≥0.5 (panic-sell), LONG vol≥0.6 (buying pressure)
+ * 6. Trade feasibility: ATR%≥0.3 floor + max 4h historical move ≥ 1.2× TP distance
+ *    (single gate replaces old separate ATR% and ADX gates — measures directly
+ *    whether the TP is statistically reachable in the 4h holding window)
+ * 7. Execute within 60 seconds of event detection
+ * 8. Tight SL (1.5x ATR), TP 1.8x ATR — realistic for 4h holding
  *
- * Removed gates (telemetry showed 0 effective filtering):
+ * Removed gates (telemetry showed 0 effective filtering or full subsumption):
  *   - rsi_extreme (LONG>75, SHORT<25): subsumed by RSI momentum
- *   - move_recent (>3%, originally >6%): never triggered in production data
+ *   - move_recent (>3%): never triggered in production
+ *   - adx_min (≥18): subsumed by RSI momentum + volume gates (0/10 reject in 48h)
  */
 
 import { SentimentSignal } from '../../sentiment/types';
@@ -147,27 +148,59 @@ export function evaluateEventSignal(
   }
   if (direction === 'SHORT') passCheck('vol_short', volumeRatio, 0.5);
 
-  // --- Gate 7: LONG buying-pressure (Sprint 2B) ---
-  if (direction === 'LONG' && volumeRatio < 0.7) {
-    failCheck('vol_long', volumeRatio, 0.7, 'no_buying_pressure');
-    return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (no buying pressure, need ≥0.7)`, indicators, checks);
+  // --- Gate 7: LONG buying-pressure (lowered 0.7 → 0.6 on 2026-04-29) ---
+  // Telemetry: 83% reject rate at 0.7 (avg rejected vol 0.46). Lowering by 0.1 lets
+  // border-cases pass while still filtering the genuine "no interest" zone (<0.5).
+  if (direction === 'LONG' && volumeRatio < 0.6) {
+    failCheck('vol_long', volumeRatio, 0.6, 'no_buying_pressure');
+    return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (no buying pressure, need ≥0.6)`, indicators, checks);
   }
-  if (direction === 'LONG') passCheck('vol_long', volumeRatio, 0.7);
+  if (direction === 'LONG') passCheck('vol_long', volumeRatio, 0.6);
 
-  // --- Gate 8: ADX minimo — serve un trend confermato (Sprint 2B) ---
-  if (adxRes.adx < 18) {
-    failCheck('adx_min', adxRes.adx, 18, 'trend_too_weak');
-    return reject(symbol, `Trend troppo debole (ADX=${adxRes.adx.toFixed(0)}<18, mercato range)`, indicators, checks);
-  }
-  passCheck('adx_min', adxRes.adx, 18);
+  // Gate 8 (adx_min) REMOVED 2026-04-29 — telemetry showed 0/10 reject in 48h.
+  // All trades reaching this gate had ADX≥20 (avg 27.6); lower-ADX cases were
+  // already filtered by G6 (RSI momentum) and G7 (volume). The gate was subsumed.
 
-  // --- Gate 9: ATR% minimo — serve volatilità sufficiente per il TP (Sprint 2B) ---
+  // --- Gate 9 (replaced 2026-04-29): trade_feasibility ---
+  // Replaces the old static atr_min gate. Asks the concrete question:
+  //   "given this asset's behavior in the last 24h, is the TP at 1.8x ATR
+  //    actually reachable within the 4h holding window?"
+  //
+  // Two checks combined:
+  //   (a) Floor: ATR% ≥ 0.3 (anti-zombie absolute minimum)
+  //   (b) Reachability: max 4h-window move in last 24h must be ≥ 1.2× the
+  //       distance the TP requires (TP = 1.8 × ATR%). I.e. if recent history
+  //       shows the asset never coved the required distance in any 4h window,
+  //       the TP is statistically unreachable.
   const atrPct = (atr / currentPrice) * 100;
-  if (atrPct < 0.4) {
-    failCheck('atr_min', atrPct, 0.4, 'volatility_insufficient');
-    return reject(symbol, `Volatilità insufficiente (ATR=${atrPct.toFixed(2)}%<0.4%, TP irraggiungibile in 4h)`, indicators, checks);
+  if (atrPct < 0.3) {
+    failCheck('trade_feasibility', atrPct, 0.3, 'atr_floor_zombie_market');
+    return reject(symbol, `Asset too quiet (ATR=${atrPct.toFixed(2)}%<0.3% absolute floor)`, indicators, checks);
   }
-  passCheck('atr_min', atrPct, 0.4);
+
+  const tpDistancePct = 1.8 * atrPct;
+  // Compute max absolute % move over any rolling 4h window in the last 24h.
+  let max4hMovePct = 0;
+  if (closes.length >= 5) {
+    const windowSize = 4; // 4 candles = 4h on 1h klines
+    const lookback = Math.min(closes.length - windowSize, 24);
+    for (let i = closes.length - lookback; i < closes.length; i++) {
+      if (i < windowSize) continue;
+      const movePct = Math.abs((closes[i] - closes[i - windowSize]) / closes[i - windowSize]) * 100;
+      if (movePct > max4hMovePct) max4hMovePct = movePct;
+    }
+  }
+  const reachableScore = tpDistancePct > 0 ? max4hMovePct / tpDistancePct : 0;
+  if (reachableScore < 1.2) {
+    failCheck('trade_feasibility', reachableScore, 1.2, 'tp_not_historically_reachable');
+    return reject(
+      symbol,
+      `TP not reachable: max 4h move ${max4hMovePct.toFixed(2)}% < ${(tpDistancePct * 1.2).toFixed(2)}% (1.2× TP distance ${tpDistancePct.toFixed(2)}%)`,
+      indicators,
+      checks,
+    );
+  }
+  passCheck('trade_feasibility', reachableScore, 1.2);
 
   // --- Gate 10: Trend alignment (bonus, not required) ---
   const ema20 = calculateEMA(closes, 20);
