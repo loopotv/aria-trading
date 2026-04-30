@@ -772,6 +772,35 @@ export class TradingEngine {
       return;
     }
 
+    // ---- TOP-CAP WHITELIST (re-introduced 2026-04-30) ----
+    // The $2M 24h volume floor proved insufficient: low-cap pairs like CHIPUSDT
+    // pass it but have outsized SL hit rates (CHIPUSDT lost -$0.30 in 2h vs the
+    // typical -$0.08 on majors). Restrict event-driven trades to assets with
+    // meaningful market structure and orderbook depth.
+    const TOP_CAP_WHITELIST = new Set([
+      'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT',
+      'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
+      'SUIUSDT', 'AAVEUSDT', 'ARBUSDT', 'OPUSDT', 'NEARUSDT',
+      'HYPEUSDT', 'LTCUSDT', 'TONUSDT', 'POLUSDT', 'ATOMUSDT',
+    ]);
+    if (!TOP_CAP_WHITELIST.has(symbol)) {
+      console.log(`[Event] ${symbol} not in top-cap whitelist, skipping (low-cap risk too high)`);
+      logEvent('whitelist_reject', { asset: signal.asset, symbol });
+      const dbForWhitelist = this.experience?.getDb();
+      if (dbForWhitelist) {
+        await logGate(dbForWhitelist, {
+          gateId: 'top_cap_whitelist',
+          asset: signal.asset,
+          direction: null,
+          passed: false,
+          value: null,
+          threshold: null,
+          reason: 'not_in_top_cap_whitelist',
+        });
+      }
+      return;
+    }
+
     // Get kline data for quant filter — fetch 1h + 4h in parallel for multi-timeframe analysis (Sprint 1B)
     const [klines, klines4h] = await Promise.all([
       this.exchange.getKlines(symbol, '1h', 48),
