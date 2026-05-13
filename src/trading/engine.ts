@@ -1014,10 +1014,9 @@ export class TradingEngine {
       );
     }
 
-    // ---- F&G ASYMMETRIC GATE (Sprint 2A) ----
-    // Data 2026-04-19→24: in EXTREME_FEAR (F&G<35) i LONG vincono 80%, gli SHORT solo 50%
-    // con loss avg 4x il win avg. Il regime adjusta size ma non blocca direzione.
-    // Blocca SHORT in F&G<35 (lascia LONG passare).
+    // ---- F&G ASYMMETRIC GATES ----
+    // Original (2026-04-21 Sprint 2A): SHORT blocked when F&G < 35 — in deep
+    // panic, the dump is usually capitulated and bounces dominate.
     if (setup.direction === 'SHORT' && this.lastFearGreed < 35) {
       const reason = `SHORT blocked in EXTREME_FEAR (F&G=${this.lastFearGreed}, LONG-favored regime)`;
       console.log(`[Event] ${reason}`);
@@ -1037,11 +1036,42 @@ export class TradingEngine {
       });
       return;
     }
-    // Log F&G pass for both directions
     if (dbForGates) {
       await logGate(dbForGates, {
         gateId: 'fg_short_block', asset: signal.asset, direction: setup.direction,
         passed: true, value: this.lastFearGreed, threshold: 35,
+      });
+    }
+
+    // NEW (2026-05-13): LONG blocked when F&G ≤ 45 (persistent FEAR).
+    // Evidence: XRP+BNB LONG opened 13/05 with F&G=42 (BTC 24h was NEUTRAL ±0.3%
+    // so macro_regime did NOT override), both stopped out in <2h for -$0.23 total.
+    // The macro_regime gate only sees BTC 24h; F&G captures the persistent
+    // multi-day sentiment that 24h windows miss. When sentiment is in FEAR,
+    // bullish news rarely produces follow-through rallies — they get sold into.
+    if (setup.direction === 'LONG' && this.lastFearGreed <= 45) {
+      const reason = `LONG blocked in FEAR (F&G=${this.lastFearGreed}≤45, persistent bearish sentiment)`;
+      console.log(`[Event] ${reason}`);
+      if (dbForGates) {
+        await logGate(dbForGates, {
+          gateId: 'fg_long_block', asset: signal.asset, direction: 'LONG',
+          passed: false, value: this.lastFearGreed, threshold: 45,
+          reason: 'fg_fear_long_blocked',
+        });
+      }
+      await this.telegram.notifyEvent({
+        asset: signal.asset,
+        sentiment: signal.sentimentScore,
+        magnitude: signal.magnitude,
+        headline: item.text.slice(0, 200),
+        action: `SKIP: ${reason}`,
+      });
+      return;
+    }
+    if (dbForGates) {
+      await logGate(dbForGates, {
+        gateId: 'fg_long_block', asset: signal.asset, direction: setup.direction,
+        passed: true, value: this.lastFearGreed, threshold: 45,
       });
     }
 
