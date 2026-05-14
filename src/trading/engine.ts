@@ -1015,16 +1015,21 @@ export class TradingEngine {
     }
 
     // ---- F&G ASYMMETRIC GATES ----
-    // Original (2026-04-21 Sprint 2A): SHORT blocked when F&G < 35 — in deep
-    // panic, the dump is usually capitulated and bounces dominate.
-    if (setup.direction === 'SHORT' && this.lastFearGreed < 35) {
-      const reason = `SHORT blocked in EXTREME_FEAR (F&G=${this.lastFearGreed}, LONG-favored regime)`;
+    // SHORT blocked when F&G < 30 (tightened from 35 on 2026-05-14 — option B).
+    // Historic SHORT in F&G 30-35 sample: 3W/3L, net +$0.01 — mediocre but not
+    // disastrous, and the new rsi_adx_exhaustion gate would have filtered the
+    // worst cases (e.g. BTC SHORT RSI 37 + ADX 25 = -$0.08). Allow SHORT in
+    // the 30-34 band so the system can ride panic selling waves instead of
+    // sitting idle. Below 30 is true capitulation territory where bounce
+    // dominates and SHORT loses.
+    if (setup.direction === 'SHORT' && this.lastFearGreed < 30) {
+      const reason = `SHORT blocked in DEEP PANIC (F&G=${this.lastFearGreed}<30, bounce-risk territory)`;
       console.log(`[Event] ${reason}`);
       if (dbForGates) {
         await logGate(dbForGates, {
           gateId: 'fg_short_block', asset: signal.asset, direction: 'SHORT',
-          passed: false, value: this.lastFearGreed, threshold: 35,
-          reason: 'fg_extreme_fear_short_blocked',
+          passed: false, value: this.lastFearGreed, threshold: 30,
+          reason: 'fg_deep_panic_short_blocked',
         });
       }
       await this.telegram.notifyEvent({
@@ -1039,7 +1044,7 @@ export class TradingEngine {
     if (dbForGates) {
       await logGate(dbForGates, {
         gateId: 'fg_short_block', asset: signal.asset, direction: setup.direction,
-        passed: true, value: this.lastFearGreed, threshold: 35,
+        passed: true, value: this.lastFearGreed, threshold: 30,
       });
     }
 
