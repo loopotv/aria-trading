@@ -59,6 +59,27 @@ interface SoftOrder {
   timeoutAt?: number; // ms timestamp; if set and exceeded, force-close at market
 }
 
+/**
+ * Source reputation tier — used by the credibility filter to weight
+ * news magnitude before downstream gates evaluate it.
+ *
+ * Calibrated from the inventory in src/ingestion/sources.ts:
+ *   - Binance announcements: ground truth (listings, hacks, freezes)
+ *   - Tier-1 outlets (TheBlock, CoinDesk, Decrypt): strong editorial
+ *   - Tier-1 with bias/sensationalism (CoinTelegraph, BitcoinMagazine): base
+ *   - CryptoCompare: aggregator with mixed-quality redistribution
+ *   - Reddit: community sentiment, not journalism
+ */
+export function getSourceWeight(source: string): number {
+  const s = source.toLowerCase();
+  if (s === 'binance_announcement') return 1.5;
+  if (s === 'theblock' || s === 'coindesk' || s === 'decrypt') return 1.3;
+  if (s === 'cointelegraph' || s === 'bitcoinmagazine') return 1.0;
+  if (s === 'cryptocompare') return 0.8;
+  if (s.startsWith('reddit_')) return 0.5;
+  return 1.0; // unknown source treated as neutral
+}
+
 // Persisted across cron invocations via module-level variable (same isolate)
 const softOrders: Map<string, SoftOrder> = new Map();
 
@@ -897,8 +918,50 @@ export class TradingEngine {
     const volumes = klines.map((k: any) => parseFloat(k[5]));
     const currentPrice = closes[closes.length - 1];
 
+    // ---- SOURCE CREDIBILITY & MULTI-SOURCE CONFIRMATION (2026-05-14) ----
+    // Modulate the LLM's raw magnitude by source reputation and by how many
+    // distinct outlets are reporting the same story. The downstream gates
+    // (G1 magnitude≥0.5, composite_score sentiment component) see the adjusted
+    // value, so low-credibility single-source rumors get filtered out earlier.
+    const sourceWeight = getSourceWeight(item.source);
+    let confirmingSources = 0;
+    if (this.experience) {
+      try {
+        confirmingSources = await this.experience.countConfirmingSources(
+          signal.asset,
+          signal.category,
+          signal.sentimentScore,
+          30, // 30-minute window
+          item.text, // exclude self by title match
+        );
+      } catch (e) {
+        console.warn(`[Credibility] count failed: ${(e as Error).message?.slice(0, 60)}`);
+      }
+    }
+    // Bonus: 1 source = 1.0x, 2 = 1.2x, 3+ = 1.4x (capped)
+    const confirmationBonus = 1 + Math.min(confirmingSources, 2) * 0.2;
+    const effectiveMagnitude = Math.min(1.0, signal.magnitude * sourceWeight * confirmationBonus);
+
+    console.log(`[Credibility] ${signal.asset} src=${item.source} weight=${sourceWeight.toFixed(2)} confirm=${confirmingSources} bonus=${confirmationBonus.toFixed(2)} → magnitude ${signal.magnitude.toFixed(2)}→${effectiveMagnitude.toFixed(2)}`);
+
+    const dbForCred = this.experience?.getDb();
+    if (dbForCred) {
+      await logGate(dbForCred, {
+        gateId: 'credibility',
+        asset: signal.asset,
+        direction: null,
+        passed: effectiveMagnitude >= 0.5,
+        value: effectiveMagnitude,
+        threshold: 0.5,
+        reason: `src=${item.source}_w${sourceWeight.toFixed(1)}_conf${confirmingSources}`,
+      });
+    }
+
+    // Use the credibility-adjusted magnitude downstream — gates read this value.
+    const adjustedSignal = { ...signal, magnitude: effectiveMagnitude };
+
     // Quant filter
-    const setup = evaluateEventSignal(signal, highs, lows, closes, volumes, currentPrice);
+    const setup = evaluateEventSignal(adjustedSignal, highs, lows, closes, volumes, currentPrice);
 
     // Flush per-gate telemetry from the quant filter (Step 2 prep).
     // Each GateCheck carries its own direction (null for pre-direction gates G1-G3).

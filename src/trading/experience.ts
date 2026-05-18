@@ -123,6 +123,51 @@ export class ExperienceDB {
 
   // ---- NEWS EVENTS ----
 
+  /**
+   * Count how many DISTINCT recent news on the same asset agree with this signal's
+   * category AND sentiment direction. Used by the event-driven pipeline to apply a
+   * multi-source confirmation bonus before deciding to trade.
+   *
+   * Definition of "confirming source":
+   *   - same asset
+   *   - same category (event | rumor | announcement | sentiment_aggregate)
+   *   - same sentiment direction (positive if score>0.1, negative if <-0.1, neutral otherwise)
+   *   - within `windowMinutes` minutes
+   *   - DISTINCT source (a source repeating its own headline counts once)
+   *
+   * The caller's own news is excluded by matching on title.
+   */
+  async countConfirmingSources(
+    asset: string,
+    category: string,
+    sentimentScore: number,
+    windowMinutes: number,
+    excludeTitle: string,
+  ): Promise<number> {
+    const direction: 'positive' | 'negative' | 'neutral' =
+      sentimentScore > 0.1 ? 'positive'
+      : sentimentScore < -0.1 ? 'negative'
+      : 'neutral';
+
+    const rows = await this.db
+      .prepare(
+        `SELECT DISTINCT source FROM news_events
+         WHERE asset = ?
+           AND category = ?
+           AND title != ?
+           AND processed_at > datetime('now', '-' || ? || ' minutes')
+           AND CASE
+             WHEN ? = 'positive' THEN sentiment_score > 0.1
+             WHEN ? = 'negative' THEN sentiment_score < -0.1
+             ELSE sentiment_score BETWEEN -0.1 AND 0.1
+           END`
+      )
+      .bind(asset, category, excludeTitle, windowMinutes, direction, direction)
+      .all<{ source: string }>();
+
+    return (rows.results || []).length;
+  }
+
   /** Get recent news titles for deduplication across Worker restarts */
   async getRecentNewsTitles(hoursBack: number = 2): Promise<Set<string>> {
     const result = await this.db
