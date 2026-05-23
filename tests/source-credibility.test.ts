@@ -37,41 +37,52 @@ describe('getSourceWeight', () => {
   });
 });
 
-describe('effective magnitude scenarios', () => {
-  // Mirror of the formula in engine.ts:
-  // effectiveMagnitude = min(1.0, magnitude * sourceWeight * confirmationBonus)
-  // confirmationBonus = 1 + min(confirmingSources, 2) * 0.2
+describe('effective magnitude scenarios (soft modifier, 2026-05-21)', () => {
+  // Mirror of the rolled-back formula in engine.ts:
+  // sourceShift = (sourceWeight - 1.0) * 0.30  → ±0.15 max
+  // confirmShift = min(confirmingSources, 2) * 0.025  → +0.05 max
+  // totalShift in [-0.15, +0.20]
+  // effectiveMagnitude = clamp(0, 1, magnitude * (1 + totalShift))
   function effective(magnitude: number, sourceWeight: number, confirm: number): number {
-    const bonus = 1 + Math.min(confirm, 2) * 0.2;
-    return Math.min(1.0, magnitude * sourceWeight * bonus);
+    const sourceShift = (sourceWeight - 1.0) * 0.30;
+    const confirmShift = Math.min(confirm, 2) * 0.025;
+    const totalShift = sourceShift + confirmShift;
+    return Math.max(0, Math.min(1.0, magnitude * (1 + totalShift)));
   }
 
-  it('binance announcement at mag 0.4 passes G1 (≥0.5)', () => {
-    expect(effective(0.4, 1.5, 0)).toBeCloseTo(0.6, 2);
+  it('tier-1 (weight 1.0) with no confirmations is unchanged', () => {
+    expect(effective(0.5, 1.0, 0)).toBeCloseTo(0.5, 3);
   });
 
-  it('reddit at mag 0.6 fails G1 (no confirmation)', () => {
-    expect(effective(0.6, 0.5, 0)).toBeCloseTo(0.3, 2);
+  it('binance announcement (1.5) gives +15% magnitude boost', () => {
+    expect(effective(0.5, 1.5, 0)).toBeCloseTo(0.5 * 1.15, 3);
   });
 
-  it('cryptocompare at mag 0.5 + 2 confirmations just passes', () => {
-    // 0.5 × 0.8 × 1.4 = 0.56
-    expect(effective(0.5, 0.8, 2)).toBeCloseTo(0.56, 2);
+  it('reddit (0.5) gives -15% magnitude penalty but still passes G1 if raw mag was high', () => {
+    expect(effective(0.7, 0.5, 0)).toBeCloseTo(0.7 * 0.85, 3); // 0.595, passes G1≥0.5
+    expect(effective(0.55, 0.5, 0)).toBeCloseTo(0.55 * 0.85, 3); // 0.4675, fails G1
   });
 
-  it('cryptocompare at mag 0.5 + 1 confirmation fails', () => {
-    // 0.5 × 0.8 × 1.2 = 0.48
-    expect(effective(0.5, 0.8, 1)).toBeCloseTo(0.48, 2);
+  it('2 confirmations add +5% boost', () => {
+    expect(effective(0.5, 1.0, 2)).toBeCloseTo(0.5 * 1.05, 3);
   });
 
-  it('confirmation bonus caps at 2 extra sources', () => {
-    // 3, 4, 5 confirmations all give the same 1.4x bonus
+  it('best case (binance + 2 confirms) caps total shift at +20%', () => {
+    expect(effective(0.5, 1.5, 2)).toBeCloseTo(0.5 * 1.20, 3);
+  });
+
+  it('confirmation bonus saturates after 2 sources', () => {
     expect(effective(0.5, 1.0, 3)).toBe(effective(0.5, 1.0, 2));
     expect(effective(0.5, 1.0, 5)).toBe(effective(0.5, 1.0, 2));
   });
 
-  it('effective magnitude capped at 1.0', () => {
-    // Binance + 3 confirmations: 1.0 × 1.5 × 1.4 = 2.1 → capped to 1.0
-    expect(effective(1.0, 1.5, 3)).toBe(1.0);
+  it('clamped to 1.0 max', () => {
+    expect(effective(0.95, 1.5, 2)).toBe(1.0); // 0.95 * 1.20 = 1.14 → 1.0
+  });
+
+  it('cannot block a borderline magnitude alone (soft modifier)', () => {
+    // CryptoCompare (0.8) at mag 0.55 with no confirms: 0.55 * (1 + (0.8-1)*0.3) = 0.55 * 0.94 = 0.517
+    // Still passes G1 ≥ 0.5
+    expect(effective(0.55, 0.8, 0)).toBeGreaterThan(0.5);
   });
 });

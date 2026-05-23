@@ -918,12 +918,14 @@ export class TradingEngine {
     const volumes = klines.map((k: any) => parseFloat(k[5]));
     const currentPrice = closes[closes.length - 1];
 
-    // ---- SOURCE CREDIBILITY & MULTI-SOURCE CONFIRMATION (2026-05-14) ----
-    // Modulate the LLM's raw magnitude by source reputation and by how many
-    // distinct outlets are reporting the same story. The downstream gates
-    // (G1 magnitude≥0.5, composite_score sentiment component) see the adjusted
-    // value, so low-credibility single-source rumors get filtered out earlier.
-    const sourceWeight = getSourceWeight(item.source);
+    // ---- SOURCE CREDIBILITY (soft modifier, rollback 2026-05-21) ----
+    // Originally introduced as a hard gate on 2026-05-14 (multiplier could push
+    // magnitude × source_weight × confirmation_bonus up to 3.0x or down to ~0.3x).
+    // Result: 69% reject rate on credibility — too aggressive, killed the funnel.
+    // Soft version: shift magnitude by at most ±20% based on source reputation
+    // and confirmation. Keeps the signal but lets ground-truth and multi-source
+    // confirmations weigh slightly more without binary rejection.
+    const sourceWeight = getSourceWeight(item.source); // 0.5..1.5
     let confirmingSources = 0;
     if (this.experience) {
       try {
@@ -931,18 +933,20 @@ export class TradingEngine {
           signal.asset,
           signal.category,
           signal.sentimentScore,
-          30, // 30-minute window
-          item.text, // exclude self by title match
+          30,
+          item.text,
         );
       } catch (e) {
         console.warn(`[Credibility] count failed: ${(e as Error).message?.slice(0, 60)}`);
       }
     }
-    // Bonus: 1 source = 1.0x, 2 = 1.2x, 3+ = 1.4x (capped)
-    const confirmationBonus = 1 + Math.min(confirmingSources, 2) * 0.2;
-    const effectiveMagnitude = Math.min(1.0, signal.magnitude * sourceWeight * confirmationBonus);
+    // Soft modifier: map sourceWeight [0.5..1.5] → [-0.15..+0.15], confirms cap +0.05
+    const sourceShift = (sourceWeight - 1.0) * 0.30; // ±0.15 max
+    const confirmShift = Math.min(confirmingSources, 2) * 0.025; // +0.05 max
+    const totalShift = sourceShift + confirmShift; // clamped naturally to [-0.15, +0.20]
+    const effectiveMagnitude = Math.max(0, Math.min(1.0, signal.magnitude * (1 + totalShift)));
 
-    console.log(`[Credibility] ${signal.asset} src=${item.source} weight=${sourceWeight.toFixed(2)} confirm=${confirmingSources} bonus=${confirmationBonus.toFixed(2)} → magnitude ${signal.magnitude.toFixed(2)}→${effectiveMagnitude.toFixed(2)}`);
+    console.log(`[Credibility] ${signal.asset} src=${item.source} w=${sourceWeight.toFixed(2)} confirm=${confirmingSources} shift=${(totalShift * 100).toFixed(0)}% → magnitude ${signal.magnitude.toFixed(2)}→${effectiveMagnitude.toFixed(2)}`);
 
     const dbForCred = this.experience?.getDb();
     if (dbForCred) {
@@ -950,14 +954,13 @@ export class TradingEngine {
         gateId: 'credibility',
         asset: signal.asset,
         direction: null,
-        passed: effectiveMagnitude >= 0.5,
+        passed: true, // soft modifier — never blocks alone
         value: effectiveMagnitude,
-        threshold: 0.5,
-        reason: `src=${item.source}_w${sourceWeight.toFixed(1)}_conf${confirmingSources}`,
+        threshold: signal.magnitude,
+        reason: `src=${item.source}_shift${(totalShift * 100).toFixed(0)}%`,
       });
     }
 
-    // Use the credibility-adjusted magnitude downstream — gates read this value.
     const adjustedSignal = { ...signal, magnitude: effectiveMagnitude };
 
     // Quant filter
@@ -1077,22 +1080,21 @@ export class TradingEngine {
       );
     }
 
-    // ---- F&G ASYMMETRIC GATES ----
-    // SHORT blocked when F&G < 30 (tightened from 35 on 2026-05-14 — option B).
-    // Historic SHORT in F&G 30-35 sample: 3W/3L, net +$0.01 — mediocre but not
-    // disastrous, and the new rsi_adx_exhaustion gate would have filtered the
-    // worst cases (e.g. BTC SHORT RSI 37 + ADX 25 = -$0.08). Allow SHORT in
-    // the 30-34 band so the system can ride panic selling waves instead of
-    // sitting idle. Below 30 is true capitulation territory where bounce
-    // dominates and SHORT loses.
-    if (setup.direction === 'SHORT' && this.lastFearGreed < 30) {
-      const reason = `SHORT blocked in DEEP PANIC (F&G=${this.lastFearGreed}<30, bounce-risk territory)`;
+    // ---- F&G ASYMMETRIC GATE (SHORT) ----
+    // Rollback 2026-05-21: restored to original < 35 threshold after the more
+    // permissive < 30 + the fg_long_block paralyzed the system during F&G 25-29
+    // EXTREME_FEAR while the market rallied. A reference fork running the
+    // pre-rollback config (commit 4dc870b) showed 64.7% WR / PF 3.24 in the
+    // same 5-day window. fg_long_block fully removed; fg_short_block back to
+    // its proven 35 threshold.
+    if (setup.direction === 'SHORT' && this.lastFearGreed < 35) {
+      const reason = `SHORT blocked in EXTREME_FEAR (F&G=${this.lastFearGreed}<35, LONG-favored regime)`;
       console.log(`[Event] ${reason}`);
       if (dbForGates) {
         await logGate(dbForGates, {
           gateId: 'fg_short_block', asset: signal.asset, direction: 'SHORT',
-          passed: false, value: this.lastFearGreed, threshold: 30,
-          reason: 'fg_deep_panic_short_blocked',
+          passed: false, value: this.lastFearGreed, threshold: 35,
+          reason: 'fg_extreme_fear_short_blocked',
         });
       }
       await this.telegram.notifyEvent({
@@ -1107,39 +1109,7 @@ export class TradingEngine {
     if (dbForGates) {
       await logGate(dbForGates, {
         gateId: 'fg_short_block', asset: signal.asset, direction: setup.direction,
-        passed: true, value: this.lastFearGreed, threshold: 30,
-      });
-    }
-
-    // NEW (2026-05-13): LONG blocked when F&G ≤ 45 (persistent FEAR).
-    // Evidence: XRP+BNB LONG opened 13/05 with F&G=42 (BTC 24h was NEUTRAL ±0.3%
-    // so macro_regime did NOT override), both stopped out in <2h for -$0.23 total.
-    // The macro_regime gate only sees BTC 24h; F&G captures the persistent
-    // multi-day sentiment that 24h windows miss. When sentiment is in FEAR,
-    // bullish news rarely produces follow-through rallies — they get sold into.
-    if (setup.direction === 'LONG' && this.lastFearGreed <= 45) {
-      const reason = `LONG blocked in FEAR (F&G=${this.lastFearGreed}≤45, persistent bearish sentiment)`;
-      console.log(`[Event] ${reason}`);
-      if (dbForGates) {
-        await logGate(dbForGates, {
-          gateId: 'fg_long_block', asset: signal.asset, direction: 'LONG',
-          passed: false, value: this.lastFearGreed, threshold: 45,
-          reason: 'fg_fear_long_blocked',
-        });
-      }
-      await this.telegram.notifyEvent({
-        asset: signal.asset,
-        sentiment: signal.sentimentScore,
-        magnitude: signal.magnitude,
-        headline: item.text.slice(0, 200),
-        action: `SKIP: ${reason}`,
-      });
-      return;
-    }
-    if (dbForGates) {
-      await logGate(dbForGates, {
-        gateId: 'fg_long_block', asset: signal.asset, direction: setup.direction,
-        passed: true, value: this.lastFearGreed, threshold: 45,
+        passed: true, value: this.lastFearGreed, threshold: 35,
       });
     }
 
