@@ -52,11 +52,16 @@ interface SoftOrder {
   direction: 'LONG' | 'SHORT';
   stopLoss: number;
   takeProfit: number;
-  quantity: number;
+  quantity: number;          // current remaining qty
   entryPrice: number;
   strategy: string;
   openedAt: number;
-  timeoutAt?: number; // ms timestamp; if set and exceeded, force-close at market
+  timeoutAt?: number;
+  // Partial TP + break-even (added 2026-05-21):
+  atr?: number;              // ATR at open — used to compute partial TP level
+  originalQty?: number;      // qty at open (for reference / proportional sizing)
+  partialClosedAt?: number;  // ms timestamp of the partial-TP execution
+  partialFailCount?: number; // retry counter for failed partial close attempts
 }
 
 /**
@@ -1668,6 +1673,10 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
         strategy,
         openedAt,
         timeoutAt: timeoutHours ? openedAt + timeoutHours * 3600 * 1000 : undefined,
+        // Partial TP support: store ATR + originalQty so the SL/TP loop can
+        // compute the partial-TP trigger price and lock 50% of the position.
+        atr: indicators?.atr,
+        originalQty: quantity,
       });
       if (!slPlaced || !tpPlaced) {
         console.log(`[Trade] Software SL/TP registered for ${key} (SL=$${roundedSL}, TP=$${roundedTP})`);
@@ -1852,6 +1861,82 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
             `📈 Locked profit: <b>+$${pnl.toFixed(2)}</b>\n` +
             `Closing at market...`
           );
+        }
+      }
+
+      // ---- PARTIAL TP + BREAK-EVEN SHIFT (Idea 2+3, 2026-05-21) ----
+      // When price reaches entry ± 1.0×ATR (≈55% of the way to TP at 1.8×ATR),
+      // close 50% of the position at market to lock profit, then move SL to
+      // entry + 0.1×ATR (LONG) or entry - 0.1×ATR (SHORT) — the small buffer
+      // protects against noise-driven stop-and-reverse.
+      //
+      // After partial: position is in "free-roll" mode. SL at BE+buffer means
+      // the worst case is +small win; TP remaining at 1.8×ATR keeps full upside.
+      // Failure handling (Q4=C): retry once, then leave intact, retry next cycle.
+      if (!shouldClose && order.atr && !order.partialClosedAt) {
+        const partialTriggerLong = order.entryPrice + order.atr * 1.0;
+        const partialTriggerShort = order.entryPrice - order.atr * 1.0;
+        const triggered =
+          (order.direction === 'LONG' && currentPrice >= partialTriggerLong) ||
+          (order.direction === 'SHORT' && currentPrice <= partialTriggerShort);
+
+        if (triggered) {
+          const posAmt = Math.abs(parseFloat(pos.positionAmt));
+          const partialQty = this.exchange.roundQuantity(order.symbol, posAmt * 0.5);
+          if (partialQty > 0 && partialQty < posAmt) {
+            try {
+              const closeSide = order.direction === 'LONG' ? 'SELL' : 'BUY';
+              await this.exchange.newOrder({
+                symbol: order.symbol,
+                side: closeSide as 'BUY' | 'SELL',
+                positionSide: order.direction as 'LONG' | 'SHORT',
+                type: 'MARKET',
+                quantity: partialQty,
+                reduceOnly: true,
+              });
+
+              // Update SoftOrder: half the qty, SL moved to BE+0.1×ATR buffer
+              const buffer = order.atr * 0.1;
+              const newSL = order.direction === 'LONG'
+                ? order.entryPrice + buffer
+                : order.entryPrice - buffer;
+              order.quantity = posAmt - partialQty;
+              order.stopLoss = this.exchange.roundPrice(order.symbol, newSL);
+              order.partialClosedAt = Date.now();
+              order.partialFailCount = 0;
+              this.invalidateAccountCache();
+
+              // Approximate partial PnL: distance * partialQty
+              const partialPnl = order.direction === 'LONG'
+                ? (currentPrice - order.entryPrice) * partialQty
+                : (order.entryPrice - currentPrice) * partialQty;
+
+              console.log(`[Partial TP] ${order.symbol} ${order.direction}: closed ${partialQty} (~50%) @ $${currentPrice.toFixed(4)}, locked ≈$${partialPnl.toFixed(2)}. SL moved to $${order.stopLoss.toFixed(4)} (BE+buffer)`);
+
+              await this.telegram.sendMessage(
+                `🎯 <b>Partial TP — ${order.symbol} ${order.direction}</b>\n\n` +
+                `Closed: <code>${partialQty.toFixed(6)}</code> (50%)\n` +
+                `Price: <code>$${currentPrice.toFixed(4)}</code> (entry $${order.entryPrice.toFixed(4)})\n` +
+                `Locked: <b>≈+$${partialPnl.toFixed(2)}</b>\n` +
+                `SL moved to <code>$${order.stopLoss.toFixed(4)}</code> (BE + 0.1×ATR buffer)\n` +
+                `Remaining ${order.quantity.toFixed(6)} runs free toward TP.`
+              );
+            } catch (partialErr) {
+              order.partialFailCount = (order.partialFailCount || 0) + 1;
+              const errMsg = (partialErr as Error).message?.slice(0, 100) || 'unknown';
+              console.warn(`[Partial TP] ${order.symbol} failed (attempt ${order.partialFailCount}): ${errMsg}`);
+              if (order.partialFailCount >= 2) {
+                console.warn(`[Partial TP] ${order.symbol} giving up partial — holding original position, will retry next trigger`);
+                await this.telegram.sendMessage(
+                  `⚠️ <b>Partial TP failed twice — ${order.symbol}</b>\n\n` +
+                  `Holding original position. SL/TP unchanged.\nError: <i>${errMsg}</i>`
+                );
+                // Reset counter so we retry on next price trigger
+                order.partialFailCount = 0;
+              }
+              // Continue to standard checks — position is still intact
+            }
+          }
         }
       }
 
