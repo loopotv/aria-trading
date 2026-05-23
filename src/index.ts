@@ -29,6 +29,7 @@ type Bindings = {
   NVIDIA_API_KEY?: string;    // Deprecated: kept optional for backward compat
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHAT_ID: string;
+  CRON_SECRET?: string;       // shared secret for /cron/tick external trigger
   ENVIRONMENT: string;
   BOT_ACTIVE: string;
   AI: AiBinding;
@@ -571,20 +572,92 @@ function getEngine(env: Bindings): TradingEngine {
   return engine;
 }
 
+// Anti-duplicate lock for the trading tick: if Cloudflare's internal cron AND
+// the external cron-job.org both fire within the same UTC minute, the second
+// one is skipped. Per-isolate state (Workers run multiple isolates, so this is
+// best-effort — accept occasional duplicate runs but prevent stampede).
+let lastTickStartedAt = 0;
+
+async function runTradingTick(env: Bindings, source: 'internal' | 'external'): Promise<{ ran: boolean; reason?: string }> {
+  if (env.BOT_ACTIVE !== 'true') {
+    console.log(`[Tick/${source}] BOT_ACTIVE != 'true', skipping`);
+    return { ran: false, reason: 'bot_inactive' };
+  }
+
+  const now = Date.now();
+  if (now - lastTickStartedAt < 60_000) {
+    console.log(`[Tick/${source}] skipped — last tick ${Math.round((now - lastTickStartedAt) / 1000)}s ago (anti-duplicate lock)`);
+    return { ran: false, reason: 'too_soon' };
+  }
+  lastTickStartedAt = now;
+
+  const eng = getEngine(env);
+
+  try {
+    const binance = createExchange(env);
+    await binance.loadExchangeInfo();
+    await binance.setPositionMode(true);
+  } catch {
+    // Already set or not supported on testnet
+  }
+
+  try {
+    await eng.checkSoftOrders();
+    await eng.runCycle();
+    await eng.rebalanceMarketNeutral();
+  } catch (err) {
+    console.error(`[Tick/${source}] Error:`, (err as Error).message);
+  } finally {
+    if (env.COSTS) {
+      try {
+        await flushCosts(env.COSTS);
+      } catch (e) {
+        console.error(`[Tick/${source}] Costs flush failed:`, (e as Error).message);
+      }
+    }
+
+    const minuteNow = new Date().getMinutes();
+    if (env.DB && minuteNow < 5) {
+      try {
+        const auditExp = new ExperienceDB(env.DB);
+        const auditReport = await runAudit(eng.getExchange(), auditExp, getSoftOrderKeys(), getStartingBalance(env));
+        const alert = formatAuditAlert(auditReport.issues);
+        if (alert) {
+          const auditTelegram = new TelegramBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
+          await auditTelegram.sendMessage(alert);
+        }
+      } catch (e) {
+        console.error(`[Tick/${source}] Audit failed:`, (e as Error).message);
+      }
+    }
+  }
+
+  return { ran: true };
+}
+
+// External cron entrypoint — keeps the bot alive even when Cloudflare's
+// internal cron triggers get de-registered after rapid deploys.
+// Call from cron-job.org or GitHub Actions every 5 min with:
+//   POST /cron/tick   Authorization: Bearer <CRON_SECRET>
+app.post('/cron/tick', async (c) => {
+  const auth = c.req.header('Authorization') || '';
+  const expected = `Bearer ${c.env.CRON_SECRET || ''}`;
+  if (!c.env.CRON_SECRET || auth !== expected) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
+  const result = await runTradingTick(c.env, 'external');
+  return c.json({ ok: true, ts: new Date().toISOString(), ...result });
+});
+
 export default {
   fetch: app.fetch,
 
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
-    // Kill switch
-    if (env.BOT_ACTIVE !== 'true') {
-      console.log('[Cron] Bot is not active, skipping');
-      return;
-    }
-
-    console.log(`[Cron] ${event.cron} triggered`);
+    console.log(`[Cron/internal] ${event.cron} triggered`);
 
     // Daily snapshot cron (A1.7): runs at 23:05 UTC, separate from trading cycle.
     if (event.cron === '5 23 * * *') {
+      if (env.BOT_ACTIVE !== 'true') return;
       if (!env.DB) return;
       try {
         const exchange = createExchange(env);
@@ -592,12 +665,12 @@ export default {
         const account = await exchange.getAccountInfo();
         const btcTicker = await exchange.getTicker24hr('BTCUSDT').catch(() => ({ priceChangePercent: '0' }));
         const exp = new ExperienceDB(env.DB);
-        const today = new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
+        const today = new Date().toISOString().slice(0, 10);
         await exp.computeAndSaveDailySnapshot({
           date: today,
           endingBalance: parseFloat(account.totalWalletBalance || '0'),
           startingBalance: getStartingBalance(env),
-          regime: 'UNKNOWN', // populated when we have intraday tracking
+          regime: 'UNKNOWN',
           fearGreed: 50,
           btcChangePercent: parseFloat(btcTicker.priceChangePercent || '0'),
           llmCost: costTracker.totalCostUsd,
@@ -610,59 +683,7 @@ export default {
       return;
     }
 
-    const eng = getEngine(env);
-    const now = Date.now();
-
-    // Setup: load exchange info + enable hedge mode on first run
-    try {
-      const binance = createExchange(env);
-      await binance.loadExchangeInfo();
-      await binance.setPositionMode(true);
-    } catch {
-      // Ignore - already set or not supported on testnet
-    }
-
-    // Collect + process + rebalance in same invocation
-    // (Worker is stateless - must do everything in one shot)
-
-    try {
-      // 1. Check software SL/TP first (safety net for failed algo orders)
-      await eng.checkSoftOrders();
-
-      // 2. Collect news + process through LLM + event-driven trades
-      await eng.runCycle();
-
-      // 3. Market-neutral rebalance (engine handles timing internally)
-      await eng.rebalanceMarketNeutral();
-    } catch (err) {
-      console.error(`[Cron] Error:`, (err as Error).message);
-    } finally {
-      // 4. Always flush LLM costs to KV, even if errors occurred
-      if (env.COSTS) {
-        try {
-          await flushCosts(env.COSTS);
-          console.log(`[Costs] Flushed: ${costTracker.totalCalls} calls, $${costTracker.totalCostUsd.toFixed(4)}`);
-        } catch (e) {
-          console.error(`[Costs] Flush failed:`, (e as Error).message);
-        }
-      }
-
-      // 5. Auto audit — only run every 30 min (Hyperliquid rate limits aggressively)
-      const minuteNow = new Date().getMinutes();
-      if (env.DB && minuteNow < 5) { // runs once per ~30min (at :00 and :30)
-        try {
-          const auditExp = new ExperienceDB(env.DB);
-          const auditReport = await runAudit(eng.getExchange(), auditExp, getSoftOrderKeys(), getStartingBalance(env));
-          const alert = formatAuditAlert(auditReport.issues);
-          if (alert) {
-            const auditTelegram = new TelegramBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_CHAT_ID);
-            await auditTelegram.sendMessage(alert);
-          }
-          console.log(`[Audit] ${auditReport.issues.length} issues (${auditReport.issues.filter(i => i.severity === 'CRITICAL').length} critical)`);
-        } catch (e) {
-          console.error(`[Audit] Failed:`, (e as Error).message);
-        }
-      }
-    }
+    // Delegate the trading tick to the shared function (anti-duplicate-aware).
+    await runTradingTick(env, 'internal');
   },
 };
