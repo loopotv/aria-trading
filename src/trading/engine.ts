@@ -19,7 +19,7 @@ import { calculatePositionSize } from './risk';
 import { detectRegime, RegimeParams, formatRegimeTelegram } from './regime';
 import { ExperienceDB } from './experience';
 import { calculateCompositeScore } from './composite-score';
-import { calculateRSI, calculateADX, calculateEMA, calculateMACD } from '../utils/indicators';
+import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
 import { logGate } from './gate-telemetry';
 import {
@@ -1720,14 +1720,103 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       }
     }
 
-    if (softOrders.size === 0) return;
-
-    console.log(`[SoftSL/TP] Checking ${softOrders.size} orders...`);
-
     const account = await this.getAccount();
     const openPositions = account.positions.filter(
       (p: any) => parseFloat(p.positionAmt) !== 0
     );
+
+    // ---- ORPHAN POSITION RECOVERY (2026-05-26) ----
+    // Scan exchange-side positions and adopt any that have no corresponding
+    // softOrder entry. Happens when executeTrade fails mid-flow: the market
+    // order goes through but recordTradeOpen + softOrders.set never run, so
+    // the position is unmonitored (no SL/TP/timeout/partial-TP/trend-reversal).
+    // Recovery uses conservative SL/TP based on CURRENT price ± 1.5×ATR/1.8×ATR
+    // and registers immediately, plus alerts via Telegram so the user can audit.
+    for (const pos of openPositions) {
+      const amt = parseFloat(pos.positionAmt);
+      const direction: 'LONG' | 'SHORT' = amt > 0 ? 'LONG' : 'SHORT';
+      const key = `${pos.symbol}:${direction}`;
+      if (softOrders.has(key)) continue;
+
+      try {
+        // Fetch klines to compute a sensible ATR for SL/TP placement.
+        const klines = await this.exchange.getKlines(pos.symbol, '1h', 24);
+        if (!klines || klines.length < 15) {
+          console.warn(`[Orphan] ${pos.symbol} ${direction}: insufficient klines, skipping recovery`);
+          continue;
+        }
+        const highs = klines.map((k: any) => parseFloat(k[2]));
+        const lows = klines.map((k: any) => parseFloat(k[3]));
+        const closes = klines.map((k: any) => parseFloat(k[4]));
+        const atr = calculateATR(highs, lows, closes);
+        const currentPrice = parseFloat((pos as any).markPrice || pos.entryPrice);
+        const entryPrice = parseFloat(pos.entryPrice);
+
+        const slDistance = atr * 1.5;
+        const tpDistance = atr * 1.8;
+        const stopLoss = direction === 'LONG'
+          ? this.exchange.roundPrice(pos.symbol, currentPrice - slDistance)
+          : this.exchange.roundPrice(pos.symbol, currentPrice + slDistance);
+        const takeProfit = direction === 'LONG'
+          ? this.exchange.roundPrice(pos.symbol, currentPrice + tpDistance)
+          : this.exchange.roundPrice(pos.symbol, currentPrice - tpDistance);
+
+        // Conservative: 2h timeout (less than the standard 4h since we don't
+        // know when the position was actually opened — assume "soon" to limit
+        // exposure of an unmonitored trade).
+        const ADOPTED_TIMEOUT_HOURS = 2;
+        const openedAt = Date.now();
+        softOrders.set(key, {
+          symbol: pos.symbol,
+          direction,
+          stopLoss,
+          takeProfit,
+          quantity: Math.abs(amt),
+          entryPrice,
+          strategy: 'orphan-adopted',
+          openedAt,
+          timeoutAt: openedAt + ADOPTED_TIMEOUT_HOURS * 3600 * 1000,
+          atr,
+          originalQty: Math.abs(amt),
+        });
+
+        const dbAdopt = this.experience?.getDb();
+        if (dbAdopt) {
+          await logGate(dbAdopt, {
+            gateId: 'orphan_adopted',
+            asset: pos.symbol.replace(/USDT$/, ''),
+            direction,
+            passed: true,
+            value: Math.abs(amt),
+            threshold: null,
+            reason: `entry=${entryPrice}_mark=${currentPrice}_sl=${stopLoss}_tp=${takeProfit}`,
+          });
+        }
+        logEvent('orphan_position_adopted', {
+          symbol: pos.symbol, direction, qty: Math.abs(amt),
+          entry: entryPrice, mark: currentPrice, atr, stopLoss, takeProfit,
+        });
+
+        const unrealizedPnl = parseFloat((pos as any).unRealizedProfit || pos.unrealizedProfit || '0');
+        await this.telegram.sendMessage(
+          `🛟 <b>Orphan position ADOPTED — ${pos.symbol} ${direction}</b>\n\n` +
+          `Found exchange-side position not tracked by bot (executeTrade likely failed mid-flow).\n\n` +
+          `Qty: <code>${Math.abs(amt)}</code>\n` +
+          `Entry: <code>$${entryPrice.toFixed(4)}</code> → Mark: <code>$${currentPrice.toFixed(4)}</code>\n` +
+          `Current PnL: <code>${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(2)}</code>\n` +
+          `<b>Adopted SL/TP (1.5×/1.8× ATR from current):</b>\n` +
+          `SL <code>$${stopLoss.toFixed(4)}</code> | TP <code>$${takeProfit.toFixed(4)}</code>\n` +
+          `Timeout: 2h from now\n\n` +
+          `Position is now monitored. Use <code>/close ${pos.symbol.replace(/USDT$/, '')}</code> to close manually.`
+        );
+      } catch (err) {
+        console.error(`[Orphan] ${pos.symbol} ${direction} adoption failed: ${(err as Error).message?.slice(0, 100)}`);
+      }
+    }
+
+    if (softOrders.size === 0) return;
+
+    console.log(`[SoftSL/TP] Checking ${softOrders.size} orders...`);
 
     for (const [key, order] of softOrders) {
       // Check if position still exists
