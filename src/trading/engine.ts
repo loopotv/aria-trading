@@ -21,6 +21,11 @@ import { ExperienceDB } from './experience';
 import { calculateCompositeScore } from './composite-score';
 import { STRATEGY_DEFAULTS } from './strategy-defaults';
 import { computeFluidParams } from './fluid-params';
+import { quickIdentifyAsset } from './asset-resolver';
+import { buildPriceContext } from './price-context';
+import { checkMacroRegime } from './macro-regime';
+import { checkTrendReversal } from './trend-reversal';
+import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
 import { logGate } from './gate-telemetry';
@@ -427,188 +432,9 @@ export class TradingEngine {
     }
   }
 
-  /**
-   * Pre-identify the most likely asset from a news item using keyword matching.
-   * Returns the ticker (e.g. "BTC") so we can fetch its price context BEFORE the LLM call.
-   * If no clear asset is found, returns null and the LLM runs without price context.
-   */
-  private quickIdentifyAsset(item: RawTextItem): string | null {
-    if (item.relatedAssets && item.relatedAssets.length > 0) {
-      return item.relatedAssets[0];
-    }
-    const t = item.text.toLowerCase();
-    const map: Array<[string, string]> = [
-      ['bitcoin', 'BTC'], ['btc', 'BTC'],
-      ['ethereum', 'ETH'], ['ether', 'ETH'], [' eth ', 'ETH'],
-      ['solana', 'SOL'], [' sol ', 'SOL'],
-      ['binance coin', 'BNB'], [' bnb ', 'BNB'],
-      ['ripple', 'XRP'], [' xrp ', 'XRP'],
-      ['dogecoin', 'DOGE'], [' doge ', 'DOGE'],
-      ['cardano', 'ADA'], [' ada ', 'ADA'],
-      ['avalanche', 'AVAX'], [' avax ', 'AVAX'],
-      ['polkadot', 'DOT'], [' dot ', 'DOT'],
-      ['chainlink', 'LINK'], [' link ', 'LINK'],
-      ['polygon', 'POL'], [' matic ', 'POL'],
-      ['litecoin', 'LTC'], [' ltc ', 'LTC'],
-      ['toncoin', 'TON'], [' ton ', 'TON'],
-      ['aave', 'AAVE'],
-      ['sui', 'SUI'], ['arbitrum', 'ARB'], ['optimism', 'OP'],
-      ['uniswap', 'UNI'], ['near protocol', 'NEAR'],
-    ];
-    for (const [kw, ticker] of map) {
-      if (t.includes(kw)) return ticker;
-    }
-    return null;
-  }
-
-  /**
-   * Build a PriceContext for the LLM sensor by fetching klines on multiple timeframes.
-   * Returns null if any fetch fails (LLM falls back to text-only mode).
-   */
-  private async buildPriceContext(asset: string): Promise<PriceContext | null> {
-    const symbol = asset + 'USDT';
-    if (!this.exchange.isSymbolAvailable(symbol)) return null;
-    try {
-      // Fetch in parallel: 5m (60 bars = 5h), 1h (24 bars = 1d), no 4h needed (covered by 1h)
-      const [k5m, k1h] = await Promise.all([
-        this.exchange.getKlines(symbol, '5m', 60),
-        this.exchange.getKlines(symbol, '1h', 25),
-      ]);
-      if (!k5m?.length || !k1h?.length) return null;
-
-      const close5m = (idx: number) => parseFloat((k5m[k5m.length - 1 - idx] || [])[4] as any);
-      const close1h = (idx: number) => parseFloat((k1h[k1h.length - 1 - idx] || [])[4] as any);
-      const current = close5m(0);
-      const p5mAgo = close5m(1);
-      const p1hAgo = close5m(12);  // 12 × 5m = 1h
-      const p4hAgo = close1h(4);
-      const p24hAgo = close1h(24);
-
-      const pct = (now: number, then: number) => then > 0 ? ((now - then) / then) * 100 : 0;
-
-      // Volume ratio: last 24h vol / 7-day average (use 1h klines: last 24 vs avg of all 25)
-      const vols = k1h.map((k: any) => parseFloat(k[5]));
-      const last24Vol = vols.slice(-24).reduce((a, b) => a + b, 0);
-      const avgPer24 = vols.reduce((a, b) => a + b, 0) * (24 / vols.length);
-      const volRatio24h = avgPer24 > 0 ? last24Vol / avgPer24 : 1;
-
-      return {
-        asset,
-        current,
-        pct5m: pct(current, p5mAgo),
-        pct1h: pct(current, p1hAgo),
-        pct4h: pct(current, p4hAgo),
-        pct24h: pct(current, p24hAgo),
-        volRatio24h,
-      };
-    } catch (e) {
-      console.warn(`[PriceContext] ${asset} failed: ${(e as Error).message?.slice(0, 60)}`);
-      return null;
-    }
-  }
-
-  /**
-   * Check if the trend has reversed against an open position.
-   * Returns flipped=true if 2 of 3 signals point opposite to the trade direction:
-   *   1. MACD histogram has flipped opposite
-   *   2. RSI has crossed 50 against the trade
-   *   3. Price has crossed EMA20 against the trade
-   * Used by checkSoftOrders to early-exit profitable positions before they decay.
-   */
-  /**
-   * Macro regime check: looks at BTC 24h % change as the dominant market direction.
-   * Returns one of:
-   *   - 'BULL': BTC 24h > +1.5%
-   *   - 'BEAR': BTC 24h < -1.5%
-   *   - 'NEUTRAL': otherwise
-   *
-   * Cached for 10 minutes via Cache API to avoid duplicate fetches per cron cycle.
-   * Returns 'NEUTRAL' on any fetch error (fail-safe: never block trades on infra issues).
-   */
-  private async checkMacroRegime(): Promise<{ regime: 'BULL' | 'BEAR' | 'NEUTRAL'; btcPct24h: number }> {
-    const cacheKey = 'https://aria-internal.cache/macro-btc-24h';
-    const cache = (caches as any).default as Cache | undefined;
-
-    if (cache) {
-      try {
-        const cached = await cache.match(cacheKey);
-        if (cached) {
-          const json = await cached.json() as { btcPct24h: number };
-          return classifyRegime(json.btcPct24h);
-        }
-      } catch { /* fall through */ }
-    }
-
-    try {
-      const klines = await this.exchange.getKlines('BTCUSDT', '1h', 25);
-      if (!klines || klines.length < 25) return { regime: 'NEUTRAL', btcPct24h: 0 };
-      const closes = klines.map((k: any) => parseFloat(k[4]));
-      const now = closes[closes.length - 1];
-      const ago24h = closes[0];
-      const btcPct24h = ago24h > 0 ? ((now - ago24h) / ago24h) * 100 : 0;
-
-      if (cache) {
-        try {
-          const resp = new Response(JSON.stringify({ btcPct24h }), {
-            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=600' },
-          });
-          await cache.put(cacheKey, resp);
-        } catch { /* best effort */ }
-      }
-
-      return classifyRegime(btcPct24h);
-    } catch {
-      return { regime: 'NEUTRAL', btcPct24h: 0 };
-    }
-
-    function classifyRegime(btcPct24h: number): { regime: 'BULL' | 'BEAR' | 'NEUTRAL'; btcPct24h: number } {
-      const regime: 'BULL' | 'BEAR' | 'NEUTRAL' =
-        btcPct24h > 1.5 ? 'BULL'
-        : btcPct24h < -1.5 ? 'BEAR'
-        : 'NEUTRAL';
-      return { regime, btcPct24h };
-    }
-  }
-
-  private async checkTrendReversal(
-    symbol: string,
-    direction: 'LONG' | 'SHORT',
-    currentPrice: number,
-  ): Promise<{ flipped: boolean; signals: string }> {
-    try {
-      const klines = await this.exchange.getKlines(symbol, '1h', 30);
-      if (!klines?.length || klines.length < 26) return { flipped: false, signals: 'insufficient-data' };
-
-      const closes = klines.map((k: any) => parseFloat(k[4]));
-      const rsi = calculateRSI(closes);
-      const macd = calculateMACD(closes);
-      const ema20Arr = calculateEMA(closes, 20);
-      const ema20 = ema20Arr[ema20Arr.length - 1];
-
-      const isLong = direction === 'LONG';
-
-      // Signal 1: MACD histogram flipped against us
-      const macdAgainst = isLong ? macd.histogram < 0 : macd.histogram > 0;
-
-      // Signal 2: RSI crossed 50 against us (LONG: RSI<50 = momentum lost; SHORT: RSI>50)
-      const rsiAgainst = isLong ? rsi < 50 : rsi > 50;
-
-      // Signal 3: Price crossed EMA20 against us
-      const priceAgainst = isLong ? currentPrice < ema20 : currentPrice > ema20;
-
-      const flips = [macdAgainst, rsiAgainst, priceAgainst].filter(Boolean).length;
-      const signalNames = [
-        macdAgainst ? 'MACD' : null,
-        rsiAgainst ? 'RSI' : null,
-        priceAgainst ? 'EMA20' : null,
-      ].filter(Boolean).join('+');
-
-      return { flipped: flips >= 2, signals: signalNames || 'none' };
-    } catch (e) {
-      console.warn(`[TrendReversal] ${symbol} check failed: ${(e as Error).message?.slice(0, 60)}`);
-      return { flipped: false, signals: 'error' };
-    }
-  }
+  // Note: quickIdentifyAsset, buildPriceContext, checkMacroRegime, checkTrendReversal
+  // were extracted to dedicated modules in Step 3 (asset-resolver.ts,
+  // price-context.ts, macro-regime.ts, trend-reversal.ts) to slim down engine.ts.
 
   // ====================================================================
   // STEP 1 — Capital preservation gates (daily loss + funding)
@@ -687,111 +513,7 @@ export class TradingEngine {
     }
   }
 
-  /**
-   * Funding-rate entry gate. Asymmetric thresholds account for the ~11.6% APR
-   * baseline that LONGs structurally pay on Hyperliquid:
-   *   - LONG threshold:  +X% APR  (default +50)
-   *   - SHORT threshold: -(X-15)% APR  (default -35)
-   * The 15% offset normalizes the "real cost above baseline" between sides.
-   *
-   * Fail-safe: if funding fetch fails or exchange doesn't expose it, allow trade.
-   */
-  private async checkFundingGate(
-    asset: string,
-    direction: 'LONG' | 'SHORT',
-  ): Promise<{ allowed: boolean; fundingAnnualPct?: number }> {
-    if (!this.exchange.getFundingRate) return { allowed: true };
-    const db = this.experience?.getDb();
-
-    let funding: number | null;
-    try {
-      funding = await this.exchange.getFundingRate(asset);
-    } catch (err) {
-      logError('funding_fetch_failed', err, { asset });
-      return { allowed: true };
-    }
-    if (funding == null) return { allowed: true };
-
-    const fundingAnnualPct = funding * 24 * 365 * 100;
-    const baseThr = this.config.fundingGateThresholdPct ?? 50;
-    const longThr = baseThr;          // e.g. +50
-    const shortThr = -(baseThr - 15); // e.g. -35
-
-    // Extreme funding alert (>500% absolute) — log but does not by itself reject
-    if (Math.abs(fundingAnnualPct) > 500) {
-      logEvent('extreme_funding_detected', { asset, funding_annual_pct: fundingAnnualPct, funding_hourly: funding });
-    }
-
-    const gateId = direction === 'LONG' ? 'funding_long' : 'funding_short';
-    if (direction === 'LONG' && fundingAnnualPct > longThr) {
-      logEvent('funding_gate_reject', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: longThr });
-      await logGate(db, {
-        gateId, asset, direction, passed: false,
-        value: fundingAnnualPct, threshold: longThr,
-        reason: 'FUNDING_TOO_HIGH_LONG',
-      });
-      return { allowed: false, fundingAnnualPct };
-    }
-    if (direction === 'SHORT' && fundingAnnualPct < shortThr) {
-      logEvent('funding_gate_reject', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: shortThr });
-      await logGate(db, {
-        gateId, asset, direction, passed: false,
-        value: fundingAnnualPct, threshold: shortThr,
-        reason: 'FUNDING_TOO_LOW_SHORT',
-      });
-      return { allowed: false, fundingAnnualPct };
-    }
-
-    await logGate(db, {
-      gateId, asset, direction, passed: true,
-      value: fundingAnnualPct,
-      threshold: direction === 'LONG' ? longThr : shortThr,
-    });
-    return { allowed: true, fundingAnnualPct };
-  }
-
-  /**
-   * Mid-trade emergency funding exit. Returns true if the position must be force-closed.
-   * Fail-safe: on fetch error, returns false (no action) — never close on missing data.
-   * Always logs to gate_telemetry as 'funding_monitor' (passed=true if no exit).
-   */
-  private async checkEmergencyFundingExit(
-    asset: string,
-    direction: 'LONG' | 'SHORT',
-  ): Promise<{ exit: boolean; fundingAnnualPct?: number }> {
-    if (!this.exchange.getFundingRate) return { exit: false };
-    const db = this.experience?.getDb();
-
-    let funding: number | null;
-    try {
-      funding = await this.exchange.getFundingRate(asset);
-    } catch (err) {
-      logError('funding_monitor_fetch_failed', err, { asset });
-      return { exit: false }; // fail-safe: never force-close on missing data
-    }
-    if (funding == null) return { exit: false };
-
-    const fundingAnnualPct = funding * 24 * 365 * 100;
-    const emergencyThr = this.config.fundingEmergencyExitPct ?? 500;
-
-    const triggered = (direction === 'LONG' && fundingAnnualPct > emergencyThr) ||
-                      (direction === 'SHORT' && fundingAnnualPct < -emergencyThr);
-
-    await logGate(db, {
-      gateId: 'funding_monitor',
-      asset,
-      direction,
-      passed: !triggered,
-      value: fundingAnnualPct,
-      threshold: direction === 'LONG' ? emergencyThr : -emergencyThr,
-      reason: triggered ? 'EMERGENCY_FUNDING_EXIT' : null,
-    });
-
-    if (triggered) {
-      logEvent('emergency_funding_exit_triggered', { asset, direction, funding_annual_pct: fundingAnnualPct, threshold: emergencyThr });
-    }
-    return { exit: triggered, fundingAnnualPct };
-  }
+  // Funding gates extracted to funding-gates.ts (Step 3, 2026-05-27)
 
   /**
    * Process a high-impact event through the full pipeline.
@@ -807,10 +529,10 @@ export class TradingEngine {
     }
 
     // Pre-identify asset to fetch price context before the LLM call (Sprint 1A).
-    const preAsset = this.quickIdentifyAsset(item);
+    const preAsset = quickIdentifyAsset(item);
     let priceContext: PriceContext | null = null;
     if (preAsset) {
-      priceContext = await this.buildPriceContext(preAsset);
+      priceContext = await buildPriceContext(this.exchange, preAsset);
       if (priceContext) {
         console.log(`[Event] Price context for ${preAsset}: 5m=${priceContext.pct5m.toFixed(2)}% 1h=${priceContext.pct1h.toFixed(2)}% 4h=${priceContext.pct4h.toFixed(2)}% 24h=${priceContext.pct24h.toFixed(2)}%`);
       }
@@ -1030,7 +752,7 @@ export class TradingEngine {
     //
     // The "double confirmation" (macro + asset 4h) prevents random inversions
     // when only the macro is moving but the specific asset isn't.
-    const macro = await this.checkMacroRegime();
+    const macro = await checkMacroRegime(this.exchange);
     const assetPct4h = priceContext?.pct4h ?? 0;
     let macroAction: 'inverted' | 'skipped' | 'pass' = 'pass';
     let originalDirection: 'LONG' | 'SHORT' = setup.direction;
@@ -1138,7 +860,13 @@ export class TradingEngine {
     // ---- STEP 1.2 — Funding rate entry gate ----
     // Asymmetric thresholds: LONG +50% APR, SHORT -35% APR (15% offset accounts
     // for the ~11.6% APR baseline that LONGs structurally pay on Hyperliquid).
-    const fundingCheck = await this.checkFundingGate(signal.asset, setup.direction);
+    const fundingCheck = await checkFundingGate(
+      this.exchange,
+      signal.asset,
+      setup.direction,
+      this.config.fundingGateThresholdPct ?? 50,
+      this.experience?.getDb(),
+    );
     if (!fundingCheck.allowed) {
       const reason = `Funding ${setup.direction === 'LONG' ? 'too high' : 'too low'} (${fundingCheck.fundingAnnualPct?.toFixed(0)}% APR)`;
       console.log(`[Event] ${reason}`);
@@ -1983,7 +1711,13 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       const assetForFunding = order.symbol.endsWith('USDT')
         ? order.symbol.slice(0, -4)
         : order.symbol;
-      const emergencyCheck = await this.checkEmergencyFundingExit(assetForFunding, order.direction);
+      const emergencyCheck = await checkEmergencyFundingExit(
+        this.exchange,
+        assetForFunding,
+        order.direction,
+        this.config.fundingEmergencyExitPct ?? 500,
+        this.experience?.getDb(),
+      );
       if (emergencyCheck.exit) {
         shouldClose = true;
         reason = `🚨 EMERGENCY funding (${emergencyCheck.fundingAnnualPct?.toFixed(0)}% APR > threshold)`;
@@ -2001,7 +1735,7 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       // Protects winners from decaying back to break-even at the 4h timeout.
       const heldMin = (Date.now() - order.openedAt) / 60000;
       if (!shouldClose && pnl > 0 && heldMin >= 60) {
-        const reversal = await this.checkTrendReversal(order.symbol, order.direction, currentPrice);
+        const reversal = await checkTrendReversal(this.exchange, order.symbol, order.direction, currentPrice);
 
         // Telemetry: record every check so we can verify the gate is alive
         reversalChecks.push({
