@@ -19,6 +19,7 @@ import { calculatePositionSize } from './risk';
 import { detectRegime, RegimeParams, formatRegimeTelegram } from './regime';
 import { ExperienceDB } from './experience';
 import { calculateCompositeScore } from './composite-score';
+import { STRATEGY_DEFAULTS } from './strategy-defaults';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
 import { logGate } from './gate-telemetry';
@@ -1171,6 +1172,41 @@ export class TradingEngine {
       return;
     }
 
+    // ---- LONG FEAR BLOCK (Step 1, 2026-05-27 — intelligent version) ----
+    // In F&G 26-39 (Fear, not Extreme), LONG signals have historically negative
+    // expected value because the market sells through bullish news. Block unless
+    // composite is strong enough to override the macro pessimism. Replaces the
+    // old binary fg_long_block (≤45 = reject all) that paralyzed the bot.
+    // EXTREME_FEAR (F&G≤25) is handled separately by regime sizing biases.
+    if (
+      setup.direction === 'LONG' &&
+      this.lastFearGreed > 25 &&
+      this.lastFearGreed < 40 &&
+      composite.score < STRATEGY_DEFAULTS.fearLongBlockComposite
+    ) {
+      const reason = `LONG blocked in Fear (F&G=${this.lastFearGreed}, composite=${composite.score}<${STRATEGY_DEFAULTS.fearLongBlockComposite})`;
+      console.log(`[Event] ${reason}`);
+      if (dbForGates) {
+        await logGate(dbForGates, {
+          gateId: 'fg_long_fear_block',
+          asset: signal.asset,
+          direction: 'LONG',
+          passed: false,
+          value: composite.score,
+          threshold: STRATEGY_DEFAULTS.fearLongBlockComposite,
+          reason: `long_blocked_fear_fg${this.lastFearGreed}_composite${composite.score}`,
+        });
+      }
+      await this.telegram.notifyEvent({
+        asset: signal.asset,
+        sentiment: signal.sentimentScore,
+        magnitude: signal.magnitude,
+        headline: item.text.slice(0, 200),
+        action: `SKIP: ${reason}`,
+      });
+      return;
+    }
+
     // ---- KIMI K2 STRATEGIST (Workers AI — free, fast) ----
     if (this.ai) {
       try {
@@ -1779,6 +1815,31 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           atr,
           originalQty: Math.abs(amt),
         });
+
+        // CRITICAL: persist to D1 so the next cycle's D1 recovery finds it.
+        // Without this, the softOrders map (in-isolate-only) is lost between
+        // cron invocations and we re-adopt the same position every 5min.
+        if (this.experience) {
+          try {
+            await this.experience.recordTradeOpen({
+              symbol: pos.symbol,
+              direction,
+              strategy: 'orphan-adopted',
+              entryPrice,
+              quantity: Math.abs(amt),
+              leverage: 3,
+              stopLoss,
+              takeProfit,
+              regime: this.currentRegime?.regime,
+              fearGreed: this.lastFearGreed,
+              reasoning: 'orphan-recovery',
+              atr,
+            });
+            console.log(`[Orphan] ${pos.symbol} ${direction} persisted to D1`);
+          } catch (e) {
+            console.warn(`[Orphan] D1 persist failed: ${(e as Error).message?.slice(0, 80)}`);
+          }
+        }
 
         const dbAdopt = this.experience?.getDb();
         if (dbAdopt) {

@@ -22,6 +22,7 @@
  */
 
 import { SentimentSignal } from '../../sentiment/types';
+import { STRATEGY_DEFAULTS } from '../strategy-defaults';
 import {
   calculateRSI,
   calculateADX,
@@ -94,19 +95,21 @@ export function evaluateEventSignal(
   const failCheck = (gateId: string, value: number | null, threshold: number | null, reason: string) =>
     checks.push({ gateId, direction: dirRef.current, passed: false, value, threshold, reason });
 
-  // --- Gate 1: Magnitude threshold ---
-  if (signal.magnitude < 0.5) {
-    failCheck('magnitude', signal.magnitude, 0.5, 'magnitude_low');
-    return reject(symbol, 'Magnitude too low (<0.5)', indicators, checks);
+  // --- Gate 1: Magnitude threshold (Step 1, 2026-05-27: 0.5 → 0.6) ---
+  const magMin = STRATEGY_DEFAULTS.magnitudeMin;
+  if (signal.magnitude < magMin) {
+    failCheck('magnitude', signal.magnitude, magMin, 'magnitude_low');
+    return reject(symbol, `Magnitude too low (<${magMin})`, indicators, checks);
   }
-  passCheck('magnitude', signal.magnitude, 0.5);
+  passCheck('magnitude', signal.magnitude, magMin);
 
-  // --- Gate 2: Confidence threshold ---
-  if (signal.confidence < 0.7) {
-    failCheck('confidence', signal.confidence, 0.7, 'confidence_low');
-    return reject(symbol, 'Confidence too low (<0.7)', indicators, checks);
+  // --- Gate 2: Confidence threshold (Step 1: 0.7 → 0.8) ---
+  const confMin = STRATEGY_DEFAULTS.confidenceMin;
+  if (signal.confidence < confMin) {
+    failCheck('confidence', signal.confidence, confMin, 'confidence_low');
+    return reject(symbol, `Confidence too low (<${confMin})`, indicators, checks);
   }
-  passCheck('confidence', signal.confidence, 0.7);
+  passCheck('confidence', signal.confidence, confMin);
 
   // --- Gate 3: Sentiment must have clear direction ---
   const absScore = Math.abs(signal.sentimentScore);
@@ -179,14 +182,26 @@ export function evaluateEventSignal(
   }
   if (direction === 'SHORT') passCheck('vol_short', volumeRatio, 0.5);
 
-  // --- Gate 7: LONG buying-pressure (lowered 0.7 → 0.6 on 2026-04-29) ---
-  // Telemetry: 83% reject rate at 0.7 (avg rejected vol 0.46). Lowering by 0.1 lets
-  // border-cases pass while still filtering the genuine "no interest" zone (<0.5).
-  if (direction === 'LONG' && volumeRatio < 0.6) {
-    failCheck('vol_long', volumeRatio, 0.6, 'no_buying_pressure');
-    return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (no buying pressure, need ≥0.6)`, indicators, checks);
+  // --- Gate 7: LONG buying-pressure with time-of-day adjustment (Step 1, 2026-05-27) ---
+  // Base threshold 0.7 (from STRATEGY_DEFAULTS), scaled DOWN in low-volume UTC hours
+  // because volume is naturally thinner in the Asia/Europe early morning.
+  //   0-9 UTC  → ×0.5 (night/Asia)      effective threshold ~0.35
+  //   9-15 UTC → ×0.65 (Europe + US open) effective threshold ~0.45
+  //   15-24 UTC → ×1.0 (full US session)  effective threshold 0.7
+  if (direction === 'LONG') {
+    const utcHour = new Date().getUTCHours();
+    const todMult = utcHour < 9
+      ? STRATEGY_DEFAULTS.todOffPeakNight
+      : utcHour < 15
+        ? STRATEGY_DEFAULTS.todMidDay
+        : 1.0;
+    const adjustedVolThreshold = STRATEGY_DEFAULTS.volumeRatio.LONG * todMult;
+    if (volumeRatio < adjustedVolThreshold) {
+      failCheck('vol_long', volumeRatio, adjustedVolThreshold, `no_buying_pressure_tod_${utcHour}h`);
+      return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (need ≥${adjustedVolThreshold.toFixed(2)}, base ${STRATEGY_DEFAULTS.volumeRatio.LONG.toFixed(2)}×${todMult} @${utcHour}h UTC)`, indicators, checks);
+    }
+    passCheck('vol_long', volumeRatio, adjustedVolThreshold);
   }
-  if (direction === 'LONG') passCheck('vol_long', volumeRatio, 0.6);
 
   // Gate 8 (adx_min) REMOVED 2026-04-29 — telemetry showed 0/10 reject in 48h.
   // All trades reaching this gate had ADX≥20 (avg 27.6); lower-ADX cases were
@@ -245,9 +260,11 @@ export function evaluateEventSignal(
     trendBonus = 0.1;
   }
 
-  // --- Calculate SL/TP ---
-  const slMultiplier = 1.5; // Tight SL for event trades
-  const tpMultiplier = 1.8; // Realistic TP — matches 4h holding window (was 2.5x, too ambitious)
+  // --- Calculate SL/TP (Step 1, 2026-05-27: 1.5→1.3 / 1.8→1.5) ---
+  // Tighter SL + closer TP from hyper-trader. R:R drops 1:1.2 → 1:1.15 but TP
+  // gets reached more often within the 4h timeout window.
+  const slMultiplier = STRATEGY_DEFAULTS.slAtrMultiplier;
+  const tpMultiplier = STRATEGY_DEFAULTS.tpAtrMultiplier;
 
   let stopLoss: number;
   let takeProfit: number;
