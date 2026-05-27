@@ -20,6 +20,7 @@ import { detectRegime, RegimeParams, formatRegimeTelegram } from './regime';
 import { ExperienceDB } from './experience';
 import { calculateCompositeScore } from './composite-score';
 import { STRATEGY_DEFAULTS } from './strategy-defaults';
+import { computeFluidParams } from './fluid-params';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
 import { logGate } from './gate-telemetry';
@@ -969,8 +970,23 @@ export class TradingEngine {
 
     const adjustedSignal = { ...signal, magnitude: effectiveMagnitude };
 
-    // Quant filter
-    const setup = evaluateEventSignal(adjustedSignal, highs, lows, closes, volumes, currentPrice);
+    // Step 2 (2026-05-27): compute fluid params from D1 patterns + ATR%.
+    // Adapts RSI/Vol thresholds to per-asset+regime+volatility historical
+    // performance instead of using fixed defaults.
+    const preDirection: 'LONG' | 'SHORT' = signal.sentimentScore > 0 ? 'LONG' : 'SHORT';
+    const preAtr = calculateATR(highs, lows, closes);
+    const atrPct = currentPrice > 0 ? (preAtr / currentPrice) * 100 : 1.0;
+    const fluidParams = await computeFluidParams(
+      this.experience || null,
+      signal.asset,
+      preDirection,
+      this.currentRegime?.regime || 'NEUTRAL',
+      atrPct,
+    );
+    console.log(`[Fluid] ${signal.asset} ${preDirection}: RSI≥${fluidParams.optimalRSI} Vol≥${fluidParams.volumeRatio.toFixed(2)} Ticks=${fluidParams.fluidTicks} ATR%=${atrPct.toFixed(2)}`);
+
+    // Quant filter (with fluid params adapting RSI/Vol thresholds dynamically)
+    const setup = evaluateEventSignal(adjustedSignal, highs, lows, closes, volumes, currentPrice, fluidParams);
 
     // Flush per-gate telemetry from the quant filter (Step 2 prep).
     // Each GateCheck carries its own direction (null for pre-direction gates G1-G3).

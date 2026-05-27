@@ -23,6 +23,7 @@
 
 import { SentimentSignal } from '../../sentiment/types';
 import { STRATEGY_DEFAULTS } from '../strategy-defaults';
+import type { FluidParams } from '../fluid-params';
 import {
   calculateRSI,
   calculateADX,
@@ -73,7 +74,8 @@ export function evaluateEventSignal(
   lows: number[],
   closes: number[],
   volumes: number[],
-  currentPrice: number
+  currentPrice: number,
+  fluidParams?: FluidParams,
 ): EventTradeSetup {
   const symbol = signal.asset + 'USDT';
 
@@ -162,18 +164,21 @@ export function evaluateEventSignal(
   // Avg observed 0.44%, max 1.46%. Even 3% threshold never fires; the gate is dead.
   // If we ever need anti-chasing protection again, pair with sentiment freshness check.
 
-  // --- Gate 6: RSI direction-momentum gate (Sprint 2A, lowered 45→42 on 2026-04-27) ---
-  // Telemetry: 82% reject rate at 45 (avg rejected RSI=37). Lowering to 42 trades off
-  // a few more false positives for ~25% more trade flow. Keep monitoring outcomes.
-  if (direction === 'SHORT' && rsi < 42) {
-    failCheck('rsi_momentum_short', rsi, 42, 'rsi_too_low_for_short_momentum');
-    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥42 for clean downtrend)`, indicators, checks);
+  // --- Gate 6: RSI direction-momentum gate (Step 2, 2026-05-27: now fluid) ---
+  // Threshold comes from fluidParams if provided (adapts to asset+regime+ATR
+  // historical performance via the patterns table), otherwise falls back to
+  // STRATEGY_DEFAULTS.optimalRSI (45 base, but proven losers get +3 and proven
+  // winners get -3, clamped to [35, 50]).
+  const rsiMomThreshold = fluidParams?.optimalRSI ?? STRATEGY_DEFAULTS.optimalRSI[direction];
+  if (direction === 'SHORT' && rsi < rsiMomThreshold) {
+    failCheck('rsi_momentum_short', rsi, rsiMomThreshold, 'rsi_too_low_for_short_momentum');
+    return reject(symbol, `Anti-bounce: SHORT blocked, RSI=${rsi.toFixed(0)} (need ≥${rsiMomThreshold} fluid)`, indicators, checks);
   }
-  if (direction === 'LONG' && rsi < 42) {
-    failCheck('rsi_momentum_long', rsi, 42, 'rsi_too_low_for_long_momentum');
-    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥42 for trend confirmation)`, indicators, checks);
+  if (direction === 'LONG' && rsi < rsiMomThreshold) {
+    failCheck('rsi_momentum_long', rsi, rsiMomThreshold, 'rsi_too_low_for_long_momentum');
+    return reject(symbol, `Pro-momentum: LONG blocked, RSI=${rsi.toFixed(0)} (need ≥${rsiMomThreshold} fluid)`, indicators, checks);
   }
-  passCheck(direction === 'LONG' ? 'rsi_momentum_long' : 'rsi_momentum_short', rsi, 42);
+  passCheck(direction === 'LONG' ? 'rsi_momentum_long' : 'rsi_momentum_short', rsi, rsiMomThreshold);
 
   // --- Gate 6c: SHORT volume (panic-sell) ---
   if (direction === 'SHORT' && volumeRatio < 0.5) {
@@ -182,12 +187,13 @@ export function evaluateEventSignal(
   }
   if (direction === 'SHORT') passCheck('vol_short', volumeRatio, 0.5);
 
-  // --- Gate 7: LONG buying-pressure with time-of-day adjustment (Step 1, 2026-05-27) ---
-  // Base threshold 0.7 (from STRATEGY_DEFAULTS), scaled DOWN in low-volume UTC hours
-  // because volume is naturally thinner in the Asia/Europe early morning.
-  //   0-9 UTC  → ×0.5 (night/Asia)      effective threshold ~0.35
-  //   9-15 UTC → ×0.65 (Europe + US open) effective threshold ~0.45
-  //   15-24 UTC → ×1.0 (full US session)  effective threshold 0.7
+  // --- Gate 7: LONG buying-pressure with fluid base + time-of-day (Step 1+2, 2026-05-27) ---
+  // Base threshold from fluidParams.volumeRatio if available (adapted to pattern
+  // history), else STRATEGY_DEFAULTS.volumeRatio.LONG (0.7). Then scaled DOWN
+  // in low-volume UTC hours:
+  //   0-9 UTC  → ×0.5 (night/Asia)
+  //   9-15 UTC → ×0.65 (Europe + US-open overlap)
+  //   15-24 UTC → ×1.0 (full US session)
   if (direction === 'LONG') {
     const utcHour = new Date().getUTCHours();
     const todMult = utcHour < 9
@@ -195,10 +201,11 @@ export function evaluateEventSignal(
       : utcHour < 15
         ? STRATEGY_DEFAULTS.todMidDay
         : 1.0;
-    const adjustedVolThreshold = STRATEGY_DEFAULTS.volumeRatio.LONG * todMult;
+    const baseVol = fluidParams?.volumeRatio ?? STRATEGY_DEFAULTS.volumeRatio.LONG;
+    const adjustedVolThreshold = baseVol * todMult;
     if (volumeRatio < adjustedVolThreshold) {
       failCheck('vol_long', volumeRatio, adjustedVolThreshold, `no_buying_pressure_tod_${utcHour}h`);
-      return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (need ≥${adjustedVolThreshold.toFixed(2)}, base ${STRATEGY_DEFAULTS.volumeRatio.LONG.toFixed(2)}×${todMult} @${utcHour}h UTC)`, indicators, checks);
+      return reject(symbol, `LONG blocked: vol=${volumeRatio.toFixed(2)}x (need ≥${adjustedVolThreshold.toFixed(2)}, base ${baseVol.toFixed(2)}×${todMult} @${utcHour}h UTC)`, indicators, checks);
     }
     passCheck('vol_long', volumeRatio, adjustedVolThreshold);
   }
