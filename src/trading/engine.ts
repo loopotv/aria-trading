@@ -69,6 +69,8 @@ interface SoftOrder {
   originalQty?: number;      // qty at open (for reference / proportional sizing)
   partialClosedAt?: number;  // ms timestamp of the partial-TP execution
   partialFailCount?: number; // retry counter for failed partial close attempts
+  // Trailing SL post-partial (added 2026-05-28):
+  maxFavorablePrice?: number; // highest (LONG) or lowest (SHORT) price reached since open
 }
 
 /**
@@ -1738,14 +1740,87 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
         );
       }
 
-      // Trend-reversal early-exit (Sprint 1 follow-up):
-      // If position is in profit AND held >60min AND 2/3 trend signals have flipped, close now.
-      // Protects winners from decaying back to break-even at the 4h timeout.
+      // ---- TRAILING SL POST-PARTIAL (Opzione C, 2026-05-28) ----
+      // Active only AFTER partial TP fired (50% closed, SL moved to BE+0.1×ATR).
+      // Three protections combined, the FIRST to trigger wins:
+      //   1. Trailing fixed: SL moves up to maxFavorablePrice ± 0.5×ATR
+      //   2. Pullback %: close if price retraces >30% of max gain from entry
+      //   3. Early trend-reversal: trend-reversal check from 30min post-partial (vs 45min standard)
+      // Goal: lock in gains beyond the partial when price keeps running,
+      // exit on first significant pullback instead of riding it back to BE+buffer.
+      if (!shouldClose && order.partialClosedAt && order.atr) {
+        const isLong = order.direction === 'LONG';
+
+        // 1) Track maxFavorablePrice (init to currentPrice on first post-partial cycle)
+        if (order.maxFavorablePrice == null) {
+          order.maxFavorablePrice = currentPrice;
+        } else if (isLong && currentPrice > order.maxFavorablePrice) {
+          order.maxFavorablePrice = currentPrice;
+        } else if (!isLong && currentPrice < order.maxFavorablePrice) {
+          order.maxFavorablePrice = currentPrice;
+        }
+
+        const trailDistance = order.atr * 0.5;
+        const trailingSL = isLong
+          ? order.maxFavorablePrice - trailDistance
+          : order.maxFavorablePrice + trailDistance;
+
+        // 2) Pullback %: if price retraced >30% of the gain from entry to maxFavorable
+        const maxGain = Math.abs(order.maxFavorablePrice - order.entryPrice);
+        const currentGain = isLong
+          ? currentPrice - order.entryPrice
+          : order.entryPrice - currentPrice;
+        const pullbackPct = maxGain > 0 ? 1 - (currentGain / maxGain) : 0;
+
+        // Decide: does trailing SL get hit, OR did pullback exceed 30%?
+        const trailingHit = isLong ? currentPrice <= trailingSL : currentPrice >= trailingSL;
+        const pullbackHit = pullbackPct > 0.3 && maxGain > order.atr * 0.5; // require meaningful gain first
+
+        if (trailingHit || pullbackHit) {
+          shouldClose = true;
+          reason = trailingHit
+            ? `Trailing SL (max ${order.maxFavorablePrice.toFixed(4)}, trail @ ${trailingSL.toFixed(4)})`
+            : `Pullback ${(pullbackPct * 100).toFixed(0)}% from max gain`;
+          const dbForTrail = this.experience?.getDb();
+          if (dbForTrail) {
+            await logGate(dbForTrail, {
+              gateId: 'trailing_sl_post_partial',
+              asset: order.symbol.replace(/USDT$/, ''),
+              direction: order.direction,
+              passed: false,
+              value: pullbackPct * 100,
+              threshold: 30,
+              reason: trailingHit ? 'trailing_sl_hit' : 'pullback_exceeded',
+            });
+          }
+          await this.telegram.sendMessage(
+            `🎯 <b>Trailing SL HIT — ${order.symbol} ${order.direction}</b>\n\n` +
+            `Reason: <code>${reason}</code>\n` +
+            `Max favorable: <code>$${order.maxFavorablePrice.toFixed(4)}</code>\n` +
+            `Current: <code>$${currentPrice.toFixed(4)}</code>\n` +
+            `PnL at exit: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>`
+          );
+        } else {
+          // Optionally raise the stored SL to the trailing level (so even if
+          // trailing logic disabled in future, the soft SL benefits the trade)
+          const wouldImprove = isLong ? trailingSL > order.stopLoss : trailingSL < order.stopLoss;
+          if (wouldImprove) {
+            order.stopLoss = this.exchange.roundPrice(order.symbol, trailingSL);
+          }
+        }
+      }
+
+      // Trend-reversal early-exit (Sprint 1 follow-up, hardened 2026-05-28):
+      // Active when held >45min AND pnl > -$0.02 (fees tolerance — was pnl>0, but
+      // mark-price-with-fees often shows -$0.01 right after fill, blocking the check
+      // for trades that ARE actually breakeven/positive). 2/3 of MACD/RSI/EMA20
+      // flipping against us closes the position early, locking profit before timeout decay.
       const heldMin = (Date.now() - order.openedAt) / 60000;
-      if (!shouldClose && pnl > 0 && heldMin >= 60) {
+      const FEES_TOLERANCE = -0.02;
+      if (!shouldClose && pnl > FEES_TOLERANCE && heldMin >= 45) {
         const reversal = await checkTrendReversal(this.exchange, order.symbol, order.direction, currentPrice);
 
-        // Telemetry: record every check so we can verify the gate is alive
+        // Telemetry: record every check (in-memory ring buffer + D1 persistence)
         reversalChecks.push({
           symbol: order.symbol,
           direction: order.direction,
@@ -1756,6 +1831,21 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           ts: Date.now(),
         });
         if (reversalChecks.length > MAX_REVERSAL_HISTORY) reversalChecks.shift();
+
+        // D1 persistence so we can analyze ex-post (in-memory resets on isolate cold start)
+        const dbForReversal = this.experience?.getDb();
+        if (dbForReversal) {
+          await logGate(dbForReversal, {
+            gateId: 'trend_reversal_check',
+            asset: order.symbol.replace(/USDT$/, ''),
+            direction: order.direction,
+            passed: !reversal.flipped, // passed=true means "no flip detected, hold"
+            value: pnl,
+            threshold: heldMin,
+            reason: `signals=${reversal.signals}_held${heldMin.toFixed(0)}m_pnl${pnl.toFixed(2)}`,
+          });
+        }
+
         console.log(`[TrendReversal] ${order.symbol} ${order.direction} pnl=$${pnl.toFixed(2)} held=${heldMin.toFixed(0)}m signals=${reversal.signals} flipped=${reversal.flipped}`);
 
         if (reversal.flipped) {

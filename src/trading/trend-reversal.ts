@@ -22,7 +22,11 @@ export async function checkTrendReversal(
   currentPrice: number,
 ): Promise<TrendReversalCheck> {
   try {
-    const klines = await exchange.getKlines(symbol, '1h', 30);
+    // 2026-05-28: switched from 1h klines (30 candles = 30h history) to 15m klines
+    // (60 candles = 15h history). At 4h max holding, 1h candles meant indicators
+    // updated only 4 times during the whole trade — too slow. 15m gives 16 updates,
+    // catching reversals that develop over 30-45min instead of 1-2h.
+    const klines = await exchange.getKlines(symbol, '15m', 60);
     if (!klines?.length || klines.length < 26) {
       return { flipped: false, signals: 'insufficient-data' };
     }
@@ -41,7 +45,7 @@ export async function checkTrendReversal(
     // Signal 2: RSI crossed 50 against us
     const rsiAgainst = isLong ? rsi < 50 : rsi > 50;
 
-    // Signal 3: Price crossed EMA20 against us
+    // Signal 3: Mark price crossed EMA20 against us (uses LIVE mark, not stale candle close)
     const priceAgainst = isLong ? currentPrice < ema20 : currentPrice > ema20;
 
     const flips = [macdAgainst, rsiAgainst, priceAgainst].filter(Boolean).length;
