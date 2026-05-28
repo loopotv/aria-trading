@@ -141,24 +141,11 @@ export function evaluateEventSignal(
   }
   passCheck('rsi_extreme', rsi, direction === 'LONG' ? 72 : 28);
 
-  // --- Gate 4b: RSI + ADX exhaustion (NEW 2026-05-11) ---
-  // Top-tick (or bottom-tick) BEFORE the absolute extreme. Pattern observed
-  // on 12 LONG trades since 02/05:
-  //   - RSI 65-72 + ADX ≥40: SUI (RSI 69 ADX 44) -$0.25, BNB (86, 47) -$0.12,
-  //     XRP (77, 44) -$0.12. All fast-SL within 2h, exhaustion moves.
-  //   - RSI 60-65 + ADX <40: 4/4 winners or break-even (AVAX, XRP, LINK).
-  // The combo "elevated RSI + very strong trend" signals an over-extended
-  // move where mean reversion is imminent. Symmetric for SHORT on the
-  // oversold side.
-  if (direction === 'LONG' && rsi >= 65 && adxRes.adx >= 40) {
-    failCheck('rsi_adx_exhaustion', rsi, 65, `exhaustion_long_rsi${rsi.toFixed(0)}_adx${adxRes.adx.toFixed(0)}`);
-    return reject(symbol, `LONG blocked: RSI=${rsi.toFixed(0)} + ADX=${adxRes.adx.toFixed(0)} (trend exhaustion, mean-reversion risk)`, indicators, checks);
-  }
-  if (direction === 'SHORT' && rsi <= 35 && adxRes.adx >= 40) {
-    failCheck('rsi_adx_exhaustion', rsi, 35, `exhaustion_short_rsi${rsi.toFixed(0)}_adx${adxRes.adx.toFixed(0)}`);
-    return reject(symbol, `SHORT blocked: RSI=${rsi.toFixed(0)} + ADX=${adxRes.adx.toFixed(0)} (trend exhaustion, bounce risk)`, indicators, checks);
-  }
-  passCheck('rsi_adx_exhaustion', rsi, direction === 'LONG' ? 65 : 35);
+  // Gate 4b (rsi_adx_exhaustion) REMOVED 2026-05-28 — hyper-trader doesn't have it,
+  // and telemetry shows it was blocking 4 SHORT/day at avg RSI 32 + ADX 41. Those
+  // are exactly the kind of trades hyper-trader takes successfully. The gate was
+  // added on 2026-05-11 to defend against BNB/XRP/SUI losses, but those are now
+  // covered by rsi_extreme (LONG<72, SHORT>28) + top_cap_whitelist + fluidParams.
 
   // Gate 5 (move_recent) REMOVED 2026-04-27 — 0/65 reject in 24h after lowering to 3%.
   // Avg observed 0.44%, max 1.46%. Even 3% threshold never fires; the gate is dead.

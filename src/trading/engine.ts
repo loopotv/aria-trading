@@ -577,16 +577,24 @@ export class TradingEngine {
       return;
     }
 
-    // ---- TOP-CAP WHITELIST (re-introduced 2026-04-30) ----
+    // ---- TOP-CAP WHITELIST (expanded 2026-05-28 to 41 assets per hyper-trader) ----
     // The $2M 24h volume floor proved insufficient: low-cap pairs like CHIPUSDT
-    // pass it but have outsized SL hit rates (CHIPUSDT lost -$0.30 in 2h vs the
-    // typical -$0.08 on majors). Restrict event-driven trades to assets with
-    // meaningful market structure and orderbook depth.
+    // pass it but have outsized SL hit rates. Whitelist restricts to assets with
+    // meaningful market structure. Expanded from 20→41 to match hyper-trader's
+    // tradeable universe (their reference config that produced 64.7% WR).
     const TOP_CAP_WHITELIST = new Set([
-      'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT',
-      'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
-      'SUIUSDT', 'AAVEUSDT', 'ARBUSDT', 'OPUSDT', 'NEARUSDT',
-      'HYPEUSDT', 'LTCUSDT', 'TONUSDT', 'POLUSDT', 'ATOMUSDT',
+      // Top 10 Major
+      'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT',
+      'TRXUSDT', 'DOGEUSDT', 'HYPEUSDT', 'TONUSDT', 'ADAUSDT',
+      // Top L1 & Major Altcoins
+      'AVAXUSDT', 'SUIUSDT', 'NEARUSDT', 'DOTUSDT', 'LINKUSDT',
+      'BCHUSDT', 'LTCUSDT', 'XLMUSDT', 'ICPUSDT', 'APTUSDT',
+      // High-Cap DeFi & Scaling (L2)
+      'UNIUSDT', 'AAVEUSDT', 'SKYUSDT', 'ONDOUSDT', 'OPUSDT',
+      'ARBUSDT', 'POLUSDT', 'TAOUSDT', 'INJUSDT', 'TIAUSDT', 'SEIUSDT',
+      // High-Cap Memecoins & DePIN/AI
+      'SHIBUSDT', 'PEPEUSDT', 'WLDUSDT', 'RENDERUSDT', 'HBARUSDT',
+      'ATOMUSDT', 'FETUSDT', 'JUPUSDT', 'ETCUSDT', 'FILUSDT',
     ]);
     if (!TOP_CAP_WHITELIST.has(symbol)) {
       console.log(`[Event] ${symbol} not in top-cap whitelist, skipping (low-cap risk too high)`);

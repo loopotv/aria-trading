@@ -21,8 +21,11 @@ export const STRATEGY_DEFAULTS = {
   confidenceMin: 0.8,                 // hyper-trader: 0.8 (was 0.7)
 
   // ---- RSI gates (base, pre-fluid) ----
-  /** RSI momentum threshold per direction (base, before fluid adjustment). */
-  optimalRSI: { LONG: 45, SHORT: 45 } as const,
+  /** RSI momentum threshold per direction (base, before fluid adjustment).
+   *  Lowered 45→42 on 2026-05-28 — telemetry showed 23 daily reject at 45
+   *  vs hyper-trader passing those trades successfully. fluidParams still
+   *  raises strict patterns (+3) and lowers proven winners (-3). */
+  optimalRSI: { LONG: 42, SHORT: 42 } as const,
   /** Tight extreme bands — LONG blocked above, SHORT blocked below. */
   rsiExtreme: { LONG_MAX: 72, SHORT_MIN: 28 } as const,
 
