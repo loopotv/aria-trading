@@ -764,14 +764,27 @@ export class TradingEngine {
     // when only the macro is moving but the specific asset isn't.
     const macro = await checkMacroRegime(this.exchange);
     const assetPct4h = priceContext?.pct4h ?? 0;
-    let macroAction: 'inverted' | 'skipped' | 'pass' = 'pass';
+    let macroAction: 'inverted' | 'skipped' | 'pass' | 'asset_specific_override' = 'pass';
     let originalDirection: 'LONG' | 'SHORT' = setup.direction;
 
+    // ASSET-SPECIFIC PROTECTION (2026-05-29, from hyper-trader pattern):
+    // News categories that are asset-specific catalysts. These can pump/dump
+    // the asset AGAINST the macro trend (e.g. "SOL NYSE listing" with
+    // sent=+0.9 should LONG even if BTC is -2%). High conviction = |sent|≥0.8.
+    const ASSET_SPECIFIC_CATS = ['LISTING', 'PARTNERSHIP', 'PRODUCT', 'LEGAL', 'TECHNICAL', 'announcement', 'event'];
+    const isAssetSpecific = ASSET_SPECIFIC_CATS.includes(signal.category || '');
+    const isHighConviction = Math.abs(signal.sentimentScore) >= 0.8;
+    const assetSpecificProtected = isAssetSpecific && isHighConviction;
+
     if (macro.regime === 'BEAR' && setup.direction === 'LONG') {
-      if (assetPct4h < -0.5) {
+      if (assetSpecificProtected) {
+        // Strong asset-specific catalyst → let the LONG pass even against macro.
+        // This is the key fix vs hyper-trader, which still skipped in this case.
+        macroAction = 'asset_specific_override';
+        console.log(`[Macro] BEAR regime overridden — asset-specific high-conviction (${signal.category}, sent=${signal.sentimentScore.toFixed(2)}) → LONG ${symbol} allowed`);
+      } else if (assetPct4h < -0.5) {
         // Asset confirms bear momentum → invert to SHORT
         setup.direction = 'SHORT';
-        // Recompute SL/TP for the inverted direction (mirror around current price)
         const slDist = Math.abs(currentPrice - setup.stopLoss);
         const tpDist = Math.abs(setup.takeProfit - currentPrice);
         setup.stopLoss = currentPrice + slDist;
@@ -783,7 +796,10 @@ export class TradingEngine {
         console.log(`[Macro] BEAR regime (BTC 24h ${macro.btcPct24h.toFixed(2)}%) but asset 4h ${assetPct4h.toFixed(2)}% not confirming → SKIP LONG ${symbol}`);
       }
     } else if (macro.regime === 'BULL' && setup.direction === 'SHORT') {
-      if (assetPct4h > 0.5) {
+      if (assetSpecificProtected) {
+        macroAction = 'asset_specific_override';
+        console.log(`[Macro] BULL regime overridden — asset-specific high-conviction (${signal.category}, sent=${signal.sentimentScore.toFixed(2)}) → SHORT ${symbol} allowed`);
+      } else if (assetPct4h > 0.5) {
         setup.direction = 'LONG';
         const slDist = Math.abs(setup.stopLoss - currentPrice);
         const tpDist = Math.abs(currentPrice - setup.takeProfit);
@@ -810,7 +826,9 @@ export class TradingEngine {
           ? `${macro.regime}_no_override`
           : macroAction === 'inverted'
             ? `inverted_${originalDirection}_to_${setup.direction}_asset4h_${assetPct4h.toFixed(2)}`
-            : `skipped_${originalDirection}_in_${macro.regime}_asset4h_${assetPct4h.toFixed(2)}`,
+            : macroAction === 'asset_specific_override'
+              ? `asset_specific_override_${signal.category}_sent${signal.sentimentScore.toFixed(2)}`
+              : `skipped_${originalDirection}_in_${macro.regime}_asset4h_${assetPct4h.toFixed(2)}`,
       });
     }
 
@@ -822,6 +840,15 @@ export class TradingEngine {
         `<b>Reason:</b> direction conflicts with macro, asset not confirming`
       );
       return;
+    }
+
+    if (macroAction === 'asset_specific_override') {
+      await this.telegram.sendMessage(
+        `🚀 <b>${signal.asset} ${setup.direction} — Asset-specific override</b>\n\n` +
+        `Macro: <code>${macro.regime}</code> (BTC 24h ${macro.btcPct24h.toFixed(2)}%)\n` +
+        `Category: <code>${signal.category}</code> | Sentiment: <code>${signal.sentimentScore.toFixed(2)}</code>\n` +
+        `Strong asset-specific catalyst overrides macro — trade allowed.`
+      );
     }
 
     if (macroAction === 'inverted') {
