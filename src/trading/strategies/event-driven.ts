@@ -254,22 +254,16 @@ export function evaluateEventSignal(
     trendBonus = 0.1;
   }
 
-  // --- Calculate SL/TP (Step 1, 2026-05-27: 1.5→1.3 / 1.8→1.5) ---
-  // Tighter SL + closer TP from hyper-trader. R:R drops 1:1.2 → 1:1.15 but TP
-  // gets reached more often within the 4h timeout window.
+  // --- Calculate SL only (2026-06-10: SlowTrail book — no take-profit) ---
+  // Aligned with hyper-trader's SlowTrail exit strategy: NO take-profit anywhere.
+  // The trail (after 6h, give-back 2% of peak) manages exits with the 48h deadline
+  // as ultimate fallback. takeProfit=0 is the sentinel for "no TP".
   const slMultiplier = STRATEGY_DEFAULTS.slAtrMultiplier;
-  const tpMultiplier = STRATEGY_DEFAULTS.tpAtrMultiplier;
 
-  let stopLoss: number;
-  let takeProfit: number;
-
-  if (direction === 'LONG') {
-    stopLoss = currentPrice - atr * slMultiplier;
-    takeProfit = currentPrice + atr * tpMultiplier;
-  } else {
-    stopLoss = currentPrice + atr * slMultiplier;
-    takeProfit = currentPrice - atr * tpMultiplier;
-  }
+  const stopLoss = direction === 'LONG'
+    ? currentPrice - atr * slMultiplier
+    : currentPrice + atr * slMultiplier;
+  const takeProfit = 0; // SlowTrail sentinel
 
   // Strength combines sentiment + confidence + magnitude + trend
   const strength = Math.min(1,

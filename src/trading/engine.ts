@@ -25,6 +25,7 @@ import { quickIdentifyAsset } from './asset-resolver';
 import { buildPriceContext } from './price-context';
 import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
+import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS } from './exits/slowtrail';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
@@ -58,19 +59,18 @@ interface SoftOrder {
   symbol: string;
   direction: 'LONG' | 'SHORT';
   stopLoss: number;
+  /** SlowTrail sentinel: 0 = no take-profit. Kept for backward-compat with D1 rows. */
   takeProfit: number;
-  quantity: number;          // current remaining qty
+  quantity: number;
   entryPrice: number;
   strategy: string;
   openedAt: number;
+  /** Optional 48h deadline (set by SlowTrail at registration). */
   timeoutAt?: number;
-  // Partial TP + break-even (added 2026-05-21):
-  atr?: number;              // ATR at open — used to compute partial TP level
-  originalQty?: number;      // qty at open (for reference / proportional sizing)
-  partialClosedAt?: number;  // ms timestamp of the partial-TP execution
-  partialFailCount?: number; // retry counter for failed partial close attempts
-  // Trailing SL post-partial (added 2026-05-28):
-  maxFavorablePrice?: number; // highest (LONG) or lowest (SHORT) price reached since open
+  atr?: number;
+  originalQty?: number;
+  /** SlowTrail (added 2026-06-10): best favorable close reached since open. */
+  bestClose?: number;
 }
 
 /**
@@ -1484,16 +1484,16 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
         symbol,
         direction,
         stopLoss: roundedSL,
-        takeProfit: roundedTP,
+        takeProfit: roundedTP, // SlowTrail: typically 0 (no TP)
         quantity,
         entryPrice: price,
         strategy,
         openedAt,
-        timeoutAt: timeoutHours ? openedAt + timeoutHours * 3600 * 1000 : undefined,
-        // Partial TP support: store ATR + originalQty so the SL/TP loop can
-        // compute the partial-TP trigger price and lock 50% of the position.
+        // SlowTrail deadline: 48h. The legacy `timeoutHours` arg is ignored.
+        timeoutAt: openedAt + SLOWTRAIL_DEADLINE_MS,
         atr: indicators?.atr,
         originalQty: quantity,
+        bestClose: price, // SlowTrail: initialize to entry, tracked monotonically per direction
       });
       if (!slPlaced || !tpPlaced) {
         console.log(`[Trade] Software SL/TP registered for ${key} (SL=$${roundedSL}, TP=$${roundedTP})`);
@@ -1514,21 +1514,23 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
     // Recover soft orders from D1 if in-memory map is empty (lost after deploy/restart)
     if (softOrders.size === 0 && this.experience) {
       const openTrades = await this.experience.getOpenTrades();
-      const DEFAULT_TIMEOUT_HOURS = 4; // event-driven default (Sprint 0: 2→4)
       for (const t of openTrades) {
-        if (t.stop_loss && t.take_profit) {
+        // SlowTrail: take_profit=0 is valid sentinel; only require stop_loss.
+        if (t.stop_loss) {
           const key = `${t.symbol}:${t.direction}`;
           const openedAt = new Date(t.opened_at).getTime();
           softOrders.set(key, {
             symbol: t.symbol,
             direction: t.direction as 'LONG' | 'SHORT',
             stopLoss: t.stop_loss,
-            takeProfit: t.take_profit,
+            takeProfit: t.take_profit ?? 0,
             quantity: t.quantity,
             entryPrice: t.price,
             strategy: t.strategy,
             openedAt,
-            timeoutAt: openedAt + DEFAULT_TIMEOUT_HOURS * 3600 * 1000,
+            // SlowTrail deadline: cap at openedAt + 48h (may already be in the past for recovered trades)
+            timeoutAt: openedAt + SLOWTRAIL_DEADLINE_MS,
+            bestClose: t.price, // best unknown after restart; reset to entry, will re-converge naturally
           });
         }
       }
@@ -1767,229 +1769,63 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
         );
       }
 
-      // ---- TRAILING SL POST-PARTIAL (Opzione C, 2026-05-28) ----
-      // Active only AFTER partial TP fired (50% closed, SL moved to BE+0.1×ATR).
-      // Three protections combined, the FIRST to trigger wins:
-      //   1. Trailing fixed: SL moves up to maxFavorablePrice ± 0.5×ATR
-      //   2. Pullback %: close if price retraces >30% of max gain from entry
-      //   3. Early trend-reversal: trend-reversal check from 30min post-partial (vs 45min standard)
-      // Goal: lock in gains beyond the partial when price keeps running,
-      // exit on first significant pullback instead of riding it back to BE+buffer.
-      if (!shouldClose && order.partialClosedAt && order.atr) {
-        const isLong = order.direction === 'LONG';
+      // ---- SLOWTRAIL EXIT (2026-06-10, replaces partial TP + trailing + trend-reversal + 4h timeout + TP check) ----
+      // Pure-function evaluator. Behavior:
+      //   - Held <6h: only the initial SL protects (no take-profit anywhere).
+      //   - Held ≥6h with positive excursion: trail ratchets at peak − 2% of peak.
+      //   - Held ≥48h: hard deadline force-close.
+      //   - If trail candidate would already be at/through current price: close at market
+      //     (no phantom resting stops).
+      if (!shouldClose) {
+        const initialBest = order.bestClose ?? order.entryPrice;
+        const slowState: SlowTrailState = {
+          direction: order.direction,
+          entryPrice: order.entryPrice,
+          openedAt: order.openedAt,
+          stopLoss: order.stopLoss,
+          bestClose: initialBest,
+        };
+        const decision = evaluateSlowTrail(slowState, currentPrice, Date.now());
 
-        // 1) Track maxFavorablePrice (init to currentPrice on first post-partial cycle)
-        if (order.maxFavorablePrice == null) {
-          order.maxFavorablePrice = currentPrice;
-        } else if (isLong && currentPrice > order.maxFavorablePrice) {
-          order.maxFavorablePrice = currentPrice;
-        } else if (!isLong && currentPrice < order.maxFavorablePrice) {
-          order.maxFavorablePrice = currentPrice;
-        }
+        // Always persist the updated bestClose so the next cron tick continues monotonically.
+        order.bestClose = decision.bestClose;
 
-        const trailDistance = order.atr * 0.5;
-        const trailingSL = isLong
-          ? order.maxFavorablePrice - trailDistance
-          : order.maxFavorablePrice + trailDistance;
-
-        // 2) Pullback %: if price retraced >30% of the gain from entry to maxFavorable
-        const maxGain = Math.abs(order.maxFavorablePrice - order.entryPrice);
-        const currentGain = isLong
-          ? currentPrice - order.entryPrice
-          : order.entryPrice - currentPrice;
-        const pullbackPct = maxGain > 0 ? 1 - (currentGain / maxGain) : 0;
-
-        // Decide: does trailing SL get hit, OR did pullback exceed 30%?
-        const trailingHit = isLong ? currentPrice <= trailingSL : currentPrice >= trailingSL;
-        const pullbackHit = pullbackPct > 0.3 && maxGain > order.atr * 0.5; // require meaningful gain first
-
-        if (trailingHit || pullbackHit) {
-          shouldClose = true;
-          reason = trailingHit
-            ? `Trailing SL (max ${order.maxFavorablePrice.toFixed(4)}, trail @ ${trailingSL.toFixed(4)})`
-            : `Pullback ${(pullbackPct * 100).toFixed(0)}% from max gain`;
+        if (decision.action === 'ratchet' && decision.newStop != null) {
+          order.stopLoss = this.exchange.roundPrice(order.symbol, decision.newStop);
+          console.log(`[SlowTrail] ${order.symbol} ${order.direction} ratchet SL → $${order.stopLoss.toFixed(4)} (best ${order.bestClose.toFixed(4)})`);
           const dbForTrail = this.experience?.getDb();
           if (dbForTrail) {
             await logGate(dbForTrail, {
-              gateId: 'trailing_sl_post_partial',
+              gateId: 'slowtrail_ratchet',
               asset: order.symbol.replace(/USDT$/, ''),
               direction: order.direction,
-              passed: false,
-              value: pullbackPct * 100,
-              threshold: 30,
-              reason: trailingHit ? 'trailing_sl_hit' : 'pullback_exceeded',
+              passed: true,
+              value: order.stopLoss,
+              threshold: order.bestClose,
+              reason: decision.reason,
             });
           }
+        } else if (decision.action === 'close_market') {
+          shouldClose = true;
+          reason = decision.reason;
           await this.telegram.sendMessage(
-            `🎯 <b>Trailing SL HIT — ${order.symbol} ${order.direction}</b>\n\n` +
-            `Reason: <code>${reason}</code>\n` +
-            `Max favorable: <code>$${order.maxFavorablePrice.toFixed(4)}</code>\n` +
+            `🐢 <b>SlowTrail Exit — ${order.symbol} ${order.direction}</b>\n\n` +
+            `Reason: <code>${decision.reason}</code>\n` +
+            `Best close: <code>$${order.bestClose.toFixed(4)}</code>\n` +
             `Current: <code>$${currentPrice.toFixed(4)}</code>\n` +
             `PnL at exit: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>`
           );
-        } else {
-          // Optionally raise the stored SL to the trailing level (so even if
-          // trailing logic disabled in future, the soft SL benefits the trade)
-          const wouldImprove = isLong ? trailingSL > order.stopLoss : trailingSL < order.stopLoss;
-          if (wouldImprove) {
-            order.stopLoss = this.exchange.roundPrice(order.symbol, trailingSL);
-          }
         }
       }
 
-      // Trend-reversal early-exit (Sprint 1 follow-up, hardened 2026-05-28):
-      // Active when held >45min AND pnl > -$0.02 (fees tolerance — was pnl>0, but
-      // mark-price-with-fees often shows -$0.01 right after fill, blocking the check
-      // for trades that ARE actually breakeven/positive). 2/3 of MACD/RSI/EMA20
-      // flipping against us closes the position early, locking profit before timeout decay.
-      const heldMin = (Date.now() - order.openedAt) / 60000;
-      const FEES_TOLERANCE = -0.02;
-      if (!shouldClose && pnl > FEES_TOLERANCE && heldMin >= 45) {
-        const reversal = await checkTrendReversal(this.exchange, order.symbol, order.direction, currentPrice);
-
-        // Telemetry: record every check (in-memory ring buffer + D1 persistence)
-        reversalChecks.push({
-          symbol: order.symbol,
-          direction: order.direction,
-          pnl,
-          heldMin,
-          signals: reversal.signals,
-          flipped: reversal.flipped,
-          ts: Date.now(),
-        });
-        if (reversalChecks.length > MAX_REVERSAL_HISTORY) reversalChecks.shift();
-
-        // D1 persistence so we can analyze ex-post (in-memory resets on isolate cold start)
-        const dbForReversal = this.experience?.getDb();
-        if (dbForReversal) {
-          await logGate(dbForReversal, {
-            gateId: 'trend_reversal_check',
-            asset: order.symbol.replace(/USDT$/, ''),
-            direction: order.direction,
-            passed: !reversal.flipped, // passed=true means "no flip detected, hold"
-            value: pnl,
-            threshold: heldMin,
-            reason: `signals=${reversal.signals}_held${heldMin.toFixed(0)}m_pnl${pnl.toFixed(2)}`,
-          });
-        }
-
-        console.log(`[TrendReversal] ${order.symbol} ${order.direction} pnl=$${pnl.toFixed(2)} held=${heldMin.toFixed(0)}m signals=${reversal.signals} flipped=${reversal.flipped}`);
-
-        if (reversal.flipped) {
-          shouldClose = true;
-          reason = `Trend reversal (${reversal.signals}, profit $${pnl.toFixed(2)} locked)`;
-          await this.telegram.sendMessage(
-            `🔄 <b>Trend Reversal — Early Exit</b>\n\n` +
-            `<b>${order.direction} ${order.symbol}</b>\n` +
-            `Held: ${heldMin.toFixed(0)} min\n` +
-            `Signals flipped: <code>${reversal.signals}</code>\n` +
-            `📈 Locked profit: <b>+$${pnl.toFixed(2)}</b>\n` +
-            `Closing at market...`
-          );
-        }
-      }
-
-      // ---- PARTIAL TP + BREAK-EVEN SHIFT (Idea 2+3, 2026-05-21) ----
-      // When price reaches entry ± 1.0×ATR (≈55% of the way to TP at 1.8×ATR),
-      // close 50% of the position at market to lock profit, then move SL to
-      // entry + 0.1×ATR (LONG) or entry - 0.1×ATR (SHORT) — the small buffer
-      // protects against noise-driven stop-and-reverse.
-      //
-      // After partial: position is in "free-roll" mode. SL at BE+buffer means
-      // the worst case is +small win; TP remaining at 1.8×ATR keeps full upside.
-      // Failure handling (Q4=C): retry once, then leave intact, retry next cycle.
-      if (!shouldClose && order.atr && !order.partialClosedAt) {
-        const partialTriggerLong = order.entryPrice + order.atr * 1.0;
-        const partialTriggerShort = order.entryPrice - order.atr * 1.0;
-        const triggered =
-          (order.direction === 'LONG' && currentPrice >= partialTriggerLong) ||
-          (order.direction === 'SHORT' && currentPrice <= partialTriggerShort);
-
-        if (triggered) {
-          const posAmt = Math.abs(parseFloat(pos.positionAmt));
-          const partialQty = this.exchange.roundQuantity(order.symbol, posAmt * 0.5);
-          if (partialQty > 0 && partialQty < posAmt) {
-            try {
-              const closeSide = order.direction === 'LONG' ? 'SELL' : 'BUY';
-              await this.exchange.newOrder({
-                symbol: order.symbol,
-                side: closeSide as 'BUY' | 'SELL',
-                positionSide: order.direction as 'LONG' | 'SHORT',
-                type: 'MARKET',
-                quantity: partialQty,
-                reduceOnly: true,
-              });
-
-              // Update SoftOrder: half the qty, SL moved to BE+0.1×ATR buffer
-              const buffer = order.atr * 0.1;
-              const newSL = order.direction === 'LONG'
-                ? order.entryPrice + buffer
-                : order.entryPrice - buffer;
-              order.quantity = posAmt - partialQty;
-              order.stopLoss = this.exchange.roundPrice(order.symbol, newSL);
-              order.partialClosedAt = Date.now();
-              order.partialFailCount = 0;
-              this.invalidateAccountCache();
-
-              // Approximate partial PnL: distance * partialQty
-              const partialPnl = order.direction === 'LONG'
-                ? (currentPrice - order.entryPrice) * partialQty
-                : (order.entryPrice - currentPrice) * partialQty;
-
-              console.log(`[Partial TP] ${order.symbol} ${order.direction}: closed ${partialQty} (~50%) @ $${currentPrice.toFixed(4)}, locked ≈$${partialPnl.toFixed(2)}. SL moved to $${order.stopLoss.toFixed(4)} (BE+buffer)`);
-
-              await this.telegram.sendMessage(
-                `🎯 <b>Partial TP — ${order.symbol} ${order.direction}</b>\n\n` +
-                `Closed: <code>${partialQty.toFixed(6)}</code> (50%)\n` +
-                `Price: <code>$${currentPrice.toFixed(4)}</code> (entry $${order.entryPrice.toFixed(4)})\n` +
-                `Locked: <b>≈+$${partialPnl.toFixed(2)}</b>\n` +
-                `SL moved to <code>$${order.stopLoss.toFixed(4)}</code> (BE + 0.1×ATR buffer)\n` +
-                `Remaining ${order.quantity.toFixed(6)} runs free toward TP.`
-              );
-            } catch (partialErr) {
-              order.partialFailCount = (order.partialFailCount || 0) + 1;
-              const errMsg = (partialErr as Error).message?.slice(0, 100) || 'unknown';
-              console.warn(`[Partial TP] ${order.symbol} failed (attempt ${order.partialFailCount}): ${errMsg}`);
-              if (order.partialFailCount >= 2) {
-                console.warn(`[Partial TP] ${order.symbol} giving up partial — holding original position, will retry next trigger`);
-                await this.telegram.sendMessage(
-                  `⚠️ <b>Partial TP failed twice — ${order.symbol}</b>\n\n` +
-                  `Holding original position. SL/TP unchanged.\nError: <i>${errMsg}</i>`
-                );
-                // Reset counter so we retry on next price trigger
-                order.partialFailCount = 0;
-              }
-              // Continue to standard checks — position is still intact
-            }
-          }
-        }
-      }
-
-      // Timeout gate (A1.3): force-close after timeoutHours regardless of SL/TP
-      if (!shouldClose && order.timeoutAt && Date.now() >= order.timeoutAt) {
-        shouldClose = true;
-        const heldH = (Date.now() - order.openedAt) / 3600000;
-        reason = `Timeout (held ${heldH.toFixed(1)}h, edge decayed)`;
-      }
-
-      // SL/TP checks (only if not already closing for trend-reversal or timeout)
+      // Hard SL check: the initial stop fires regardless of SlowTrail phase.
       if (!shouldClose) {
-        if (order.direction === 'LONG') {
-          if (currentPrice <= order.stopLoss) {
-            shouldClose = true;
-            reason = `SL hit ($${currentPrice.toFixed(4)} <= $${order.stopLoss.toFixed(4)})`;
-          } else if (currentPrice >= order.takeProfit) {
-            shouldClose = true;
-            reason = `TP hit ($${currentPrice.toFixed(4)} >= $${order.takeProfit.toFixed(4)})`;
-          }
-        } else {
-          if (currentPrice >= order.stopLoss) {
-            shouldClose = true;
-            reason = `SL hit ($${currentPrice.toFixed(4)} >= $${order.stopLoss.toFixed(4)})`;
-          } else if (currentPrice <= order.takeProfit) {
-            shouldClose = true;
-            reason = `TP hit ($${currentPrice.toFixed(4)} <= $${order.takeProfit.toFixed(4)})`;
-          }
+        if (order.direction === 'LONG' && currentPrice <= order.stopLoss) {
+          shouldClose = true;
+          reason = `SL hit ($${currentPrice.toFixed(4)} <= $${order.stopLoss.toFixed(4)})`;
+        } else if (order.direction === 'SHORT' && currentPrice >= order.stopLoss) {
+          shouldClose = true;
+          reason = `SL hit ($${currentPrice.toFixed(4)} >= $${order.stopLoss.toFixed(4)})`;
         }
       }
 
