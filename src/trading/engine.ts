@@ -1851,6 +1851,69 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
         );
       }
 
+      // ---- PHASE 1 WIDE TRAIL (0-6h, 2026-06-10) ----
+      // Active BEFORE SlowTrail arms (which only kicks in after 6h).
+      // Arms when peak excursion exceeds 0.4×ATR (filters fee noise & micro-wiggle).
+      // Trail distance: 50% of peak excursion from entry — wide enough to let the
+      // position breathe but tight enough to lock in significant profit if it reverses.
+      //
+      // Example: INJ SHORT entry $5.23, ATR=$0.06. Peak $5.10 (excursion $0.13).
+      // - 0.4×ATR threshold = $0.024 → peak excursion $0.13 EXCEEDS → trail arms
+      // - 50% giveback = trail at $5.10 + 0.5*$0.13 = $5.165
+      // - If price retraces to $5.17 → exit, locking ~$0.06 profit instead of a full reversal loss
+      const heldMsForTrail = Date.now() - order.openedAt;
+      const HOUR_MS = 3600_000;
+      if (!shouldClose && order.atr && heldMsForTrail < 6 * HOUR_MS) {
+        const isLong = order.direction === 'LONG';
+        const s = isLong ? 1 : -1;
+
+        // Update bestClose monotonically per direction (initialize to entry if undefined)
+        const prevBest = order.bestClose ?? order.entryPrice;
+        const newBest = s * (currentPrice - prevBest) > 0 ? currentPrice : prevBest;
+        order.bestClose = newBest;
+
+        const peakExcursion = s * (newBest - order.entryPrice);
+        const armThreshold = 0.4 * order.atr;
+
+        if (peakExcursion > armThreshold) {
+          const giveback = 0.5 * peakExcursion;
+          const trailLevel = newBest - s * giveback;
+          const trailHit = isLong ? currentPrice <= trailLevel : currentPrice >= trailLevel;
+
+          if (trailHit) {
+            shouldClose = true;
+            const lockedProfit = s * (currentPrice - order.entryPrice);
+            reason = `Phase1 wide trail (peak ${newBest.toFixed(4)}, locked ${lockedProfit.toFixed(4)})`;
+            const dbForP1 = this.experience?.getDb();
+            if (dbForP1) {
+              await logGate(dbForP1, {
+                gateId: 'phase1_wide_trail',
+                asset: order.symbol.replace(/USDT$/, ''),
+                direction: order.direction,
+                passed: false,
+                value: lockedProfit,
+                threshold: armThreshold,
+                reason: `peak_${newBest.toFixed(4)}_giveback50pct`,
+              });
+            }
+            await this.telegram.sendMessage(
+              `🪤 <b>Phase1 Wide Trail — ${order.symbol} ${order.direction}</b>\n\n` +
+              `Peak: <code>$${newBest.toFixed(4)}</code>\n` +
+              `Trail level: <code>$${trailLevel.toFixed(4)}</code>\n` +
+              `Current: <code>$${currentPrice.toFixed(4)}</code>\n` +
+              `Held: ${(heldMsForTrail / 60000).toFixed(0)} min\n` +
+              `PnL at exit: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>`
+            );
+          } else {
+            // Optionally ratchet the stored SL upward to the trail level (ratchet-only)
+            const wouldImprove = isLong ? trailLevel > order.stopLoss : trailLevel < order.stopLoss;
+            if (wouldImprove) {
+              order.stopLoss = this.exchange.roundPrice(order.symbol, trailLevel);
+            }
+          }
+        }
+      }
+
       // ---- SLOWTRAIL EXIT (2026-06-10, replaces partial TP + trailing + trend-reversal + 4h timeout + TP check) ----
       // Pure-function evaluator. Behavior:
       //   - Held <6h: only the initial SL protects (no take-profit anywhere).
