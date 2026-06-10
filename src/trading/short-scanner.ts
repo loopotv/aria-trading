@@ -1,0 +1,179 @@
+/**
+ * Short-breakdown scanner — autonomous SHORT sleeve.
+ *
+ * Once per hour, scans the top-cap whitelist for alts matching the short-breakdown
+ * conditions (see strategies/short-breakdown.ts) and opens up to MAX_SHORT_SLEEVE
+ * positions, ranked by atrPct (highest volatility first — the strategy's edge).
+ *
+ * No news/LLM dependency. When BTC is falling >1%/24h, this sleeve naturally
+ * hedges the long event-driven book; otherwise it stays silent.
+ *
+ * Adapted from hyper-trader for our smaller account / simpler infrastructure:
+ *   - Scans the full whitelist in ONE invocation (not chunked) — our cron is 5min,
+ *     not the fork's chunk-budget cadence. 40 symbols × 1 kline fetch = OK.
+ *   - State minimal: just last_hour_scanned in memory (per-isolate). On cold start
+ *     re-scan — no problem, the BTC gate filters most hours anyway.
+ *
+ * Fail-closed by design:
+ *   - BTC klines error → abort, no positions opened
+ *   - Per-symbol error → symbol skipped
+ *   - sleeve full (≥2 SHORTs from this scanner) → silent skip
+ */
+
+import type { IExchange } from '../exchange/types';
+import type { TelegramBot } from '../telegram/bot';
+import { evaluateShortBreakdown, R3T25S2 } from './strategies/short-breakdown';
+import { logEvent, logError } from '../utils/log';
+
+export const MAX_SHORT_SLEEVE = 2;
+export const SHORT_SCANNER_STRATEGY = 'short-breakdown';
+const HOUR_MS = 3600_000;
+const KLINE_LIMIT = 60;
+
+// Per-isolate state. Worst case: cold start re-scans an already-scanned hour
+// (idempotent — sleeve check + dedup-per-symbol prevents double-open).
+let lastHourScanned: number | null = null;
+
+export interface ShortScanCandidate {
+  symbol: string;
+  asset: string;
+  atrPct: number;
+  price: number;
+  atr: number;
+  adx: number;
+  stopLoss: number;
+}
+
+export interface ShortScanResult {
+  ran: boolean;
+  reason: string;
+  candidates: ShortScanCandidate[];
+}
+
+/**
+ * Compute BTC 24h return from 1h klines.
+ * Returns null on fetch error (fail-closed: caller should abort).
+ */
+async function fetchBtcReturn24h(exchange: IExchange): Promise<number | null> {
+  try {
+    const klines = await exchange.getKlines('BTCUSDT', '1h', 25);
+    if (!klines || klines.length < 25) return null;
+    const closes = klines.map((k: any) => parseFloat(k[4]));
+    const now = closes[closes.length - 1];
+    const ago24h = closes[0];
+    if (!(ago24h > 0)) return null;
+    return (now - ago24h) / ago24h;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Main entrypoint. Called from the cron loop once per cycle.
+ * - Returns early if already scanned this hour
+ * - Returns early if BTC is not down enough
+ * - Returns early if sleeve already at MAX
+ * - Otherwise scans whitelist, opens up to MAX_SHORT_SLEEVE new SHORTs
+ */
+export async function runShortBreakdownScan(args: {
+  exchange: IExchange;
+  telegram: TelegramBot;
+  whitelist: ReadonlySet<string>;
+  currentSleeveCount: number; // count of existing short-breakdown SHORTs in book
+  nowMs: number;
+}): Promise<ShortScanResult> {
+  const { exchange, telegram, whitelist, currentSleeveCount, nowMs } = args;
+  const hourKey = Math.floor(nowMs / HOUR_MS);
+
+  // Skip if we already ran in this hour
+  if (lastHourScanned === hourKey) {
+    return { ran: false, reason: 'already_scanned_this_hour', candidates: [] };
+  }
+
+  // Sleeve full → no point in scanning
+  if (currentSleeveCount >= MAX_SHORT_SLEEVE) {
+    lastHourScanned = hourKey;
+    return { ran: false, reason: `sleeve_full_${currentSleeveCount}/${MAX_SHORT_SLEEVE}`, candidates: [] };
+  }
+
+  // BTC gate
+  const btcRet24h = await fetchBtcReturn24h(exchange);
+  if (btcRet24h == null) {
+    return { ran: false, reason: 'btc_fetch_failed', candidates: [] };
+  }
+  if (!(btcRet24h < R3T25S2.BTC_RET_24H_MAX)) {
+    lastHourScanned = hourKey;
+    return { ran: false, reason: `btc_not_down_${(btcRet24h * 100).toFixed(2)}%`, candidates: [] };
+  }
+
+  // BTC is down — scan whitelist (skip BTC itself)
+  const universe = [...whitelist].filter(s => s !== 'BTCUSDT');
+  const candidates: ShortScanCandidate[] = [];
+
+  for (const symbol of universe) {
+    try {
+      const klines = await exchange.getKlines(symbol, '1h', KLINE_LIMIT);
+      if (!klines || klines.length < R3T25S2.KLINE_LIMIT_REQUIRED) continue;
+
+      const highs = klines.map((k: any) => parseFloat(k[2]));
+      const lows = klines.map((k: any) => parseFloat(k[3]));
+      const closes = klines.map((k: any) => parseFloat(k[4]));
+
+      const result = evaluateShortBreakdown(highs, lows, closes, btcRet24h);
+      if (!result.eligible) continue;
+
+      const price = closes[closes.length - 1];
+      const atr = result.atrPct * price;
+      // SHORT SL: 1.3×ATR above entry (matches event-driven slMultiplier)
+      const stopLoss = price + atr * 1.3;
+
+      candidates.push({
+        symbol,
+        asset: symbol.replace(/USDT$/, ''),
+        atrPct: result.atrPct,
+        price,
+        atr,
+        adx: result.indicators.adx,
+        stopLoss,
+      });
+    } catch (err) {
+      logError('short_scan_symbol_failed', err, { symbol });
+    }
+  }
+
+  lastHourScanned = hourKey;
+
+  if (candidates.length === 0) {
+    return { ran: true, reason: 'no_eligible_candidates', candidates: [] };
+  }
+
+  // Rank by atrPct DESC (highest volatility first = strategy's edge)
+  candidates.sort((a, b) => b.atrPct - a.atrPct);
+
+  const slotsAvailable = MAX_SHORT_SLEEVE - currentSleeveCount;
+  const toOpen = candidates.slice(0, slotsAvailable);
+
+  logEvent('short_scan_completed', {
+    btc_ret_24h_pct: btcRet24h * 100,
+    universe_size: universe.length,
+    eligible_count: candidates.length,
+    slots_available: slotsAvailable,
+    top_picks: toOpen.map(c => ({ symbol: c.symbol, atrPct: c.atrPct, adx: c.adx })),
+  });
+
+  // Telegram digest (no individual opens here — caller orchestrates executeTrade)
+  await telegram.sendMessage(
+    `🔻 <b>Short-Breakdown Scan</b>\n\n` +
+    `BTC 24h: <code>${(btcRet24h * 100).toFixed(2)}%</code>\n` +
+    `Eligible: ${candidates.length} | Slots: ${slotsAvailable}\n` +
+    `Top picks (by ATR%):\n` +
+    toOpen.map(c => `• <code>${c.symbol}</code> ATR=${(c.atrPct * 100).toFixed(2)}% ADX=${c.adx.toFixed(0)}`).join('\n')
+  );
+
+  return { ran: true, reason: 'scan_completed', candidates: toOpen };
+}
+
+/** For testing or admin: reset the hour cache. */
+export function resetShortScannerCache(): void {
+  lastHourScanned = null;
+}

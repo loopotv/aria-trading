@@ -26,6 +26,7 @@ import { buildPriceContext } from './price-context';
 import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
 import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS } from './exits/slowtrail';
+import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY } from './short-scanner';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
@@ -84,6 +85,25 @@ interface SoftOrder {
  *   - CryptoCompare: aggregator with mixed-quality redistribution
  *   - Reddit: community sentiment, not journalism
  */
+/**
+ * Top-cap tradeable whitelist (41 assets, aligned with hyper-trader).
+ * Module-level so it can be reused by both event-driven and short-scanner sleeves.
+ */
+export const TOP_CAP_WHITELIST: ReadonlySet<string> = new Set([
+  // Top 10 Major
+  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT',
+  'TRXUSDT', 'DOGEUSDT', 'HYPEUSDT', 'TONUSDT', 'ADAUSDT',
+  // Top L1 & Major Altcoins
+  'AVAXUSDT', 'SUIUSDT', 'NEARUSDT', 'DOTUSDT', 'LINKUSDT',
+  'BCHUSDT', 'LTCUSDT', 'XLMUSDT', 'ICPUSDT', 'APTUSDT',
+  // High-Cap DeFi & Scaling (L2)
+  'UNIUSDT', 'AAVEUSDT', 'SKYUSDT', 'ONDOUSDT', 'OPUSDT',
+  'ARBUSDT', 'POLUSDT', 'TAOUSDT', 'INJUSDT', 'TIAUSDT', 'SEIUSDT',
+  // High-Cap Memecoins & DePIN/AI
+  'SHIBUSDT', 'PEPEUSDT', 'WLDUSDT', 'RENDERUSDT', 'HBARUSDT',
+  'ATOMUSDT', 'FETUSDT', 'JUPUSDT', 'ETCUSDT', 'FILUSDT',
+]);
+
 export function getSourceWeight(source: string): number {
   const s = source.toLowerCase();
   if (s === 'binance_announcement') return 1.5;
@@ -287,6 +307,15 @@ export class TradingEngine {
         for (const item of highImpact.slice(0, 3)) { // Max 3 per cycle
           await this.processEventDriven(item);
         }
+      }
+
+      // 3b. Short-Breakdown Scanner (Step A, 2026-06-10): autonomous SHORT sleeve.
+      // Once per hour, scans whitelist when BTC is down >1%/24h and opens up to
+      // MAX_SHORT_SLEEVE SHORTs on alts in confirmed downtrend. Independent of news.
+      try {
+        await this.runShortScannerSleeve();
+      } catch (e) {
+        console.warn(`[ShortScanner] cycle failed: ${(e as Error).message?.slice(0, 80)}`);
       }
 
       // 4. Process normal items via Workers AI (Llama 4 Scout primary, GPT-OSS 20B fallback).
@@ -579,25 +608,7 @@ export class TradingEngine {
       return;
     }
 
-    // ---- TOP-CAP WHITELIST (expanded 2026-05-28 to 41 assets per hyper-trader) ----
-    // The $2M 24h volume floor proved insufficient: low-cap pairs like CHIPUSDT
-    // pass it but have outsized SL hit rates. Whitelist restricts to assets with
-    // meaningful market structure. Expanded from 20→41 to match hyper-trader's
-    // tradeable universe (their reference config that produced 64.7% WR).
-    const TOP_CAP_WHITELIST = new Set([
-      // Top 10 Major
-      'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT',
-      'TRXUSDT', 'DOGEUSDT', 'HYPEUSDT', 'TONUSDT', 'ADAUSDT',
-      // Top L1 & Major Altcoins
-      'AVAXUSDT', 'SUIUSDT', 'NEARUSDT', 'DOTUSDT', 'LINKUSDT',
-      'BCHUSDT', 'LTCUSDT', 'XLMUSDT', 'ICPUSDT', 'APTUSDT',
-      // High-Cap DeFi & Scaling (L2)
-      'UNIUSDT', 'AAVEUSDT', 'SKYUSDT', 'ONDOUSDT', 'OPUSDT',
-      'ARBUSDT', 'POLUSDT', 'TAOUSDT', 'INJUSDT', 'TIAUSDT', 'SEIUSDT',
-      // High-Cap Memecoins & DePIN/AI
-      'SHIBUSDT', 'PEPEUSDT', 'WLDUSDT', 'RENDERUSDT', 'HBARUSDT',
-      'ATOMUSDT', 'FETUSDT', 'JUPUSDT', 'ETCUSDT', 'FILUSDT',
-    ]);
+    // Top-cap whitelist now module-level (used by event-driven AND short-scanner)
     if (!TOP_CAP_WHITELIST.has(symbol)) {
       console.log(`[Event] ${symbol} not in top-cap whitelist, skipping (low-cap risk too high)`);
       logEvent('whitelist_reject', { asset: signal.asset, symbol });
@@ -1213,6 +1224,77 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
     console.log(`[Event] Executing trade: ${setup.direction} ${symbol}, balance: ${account.availableBalance}`);
     const balance = parseFloat(account.availableBalance);
     await this.executeTrade(symbol, setup.direction, currentPrice, setup.stopLoss, setup.takeProfit, balance, 'event-driven', signal, composite.sizeMultiplier, setup.indicators, setup.timeoutHours);
+  }
+
+  /**
+   * Short-breakdown scanner sleeve (Step A, 2026-06-10).
+   * Once per hour, checks BTC trend and scans whitelist for short candidates.
+   * Opens up to MAX_SHORT_SLEEVE positions, ranked by ATR%.
+   */
+  private async runShortScannerSleeve(): Promise<void> {
+    // Count existing short-breakdown positions in the book
+    const account = await this.getAccount();
+    const openPositions = account.positions.filter((p: any) => parseFloat(p.positionAmt) !== 0);
+    let currentSleeveCount = 0;
+    for (const pos of openPositions) {
+      const amt = parseFloat(pos.positionAmt);
+      if (amt >= 0) continue; // only count SHORTs
+      const key = `${pos.symbol}:SHORT`;
+      const order = softOrders.get(key);
+      if (order?.strategy === SHORT_SCANNER_STRATEGY) currentSleeveCount++;
+    }
+
+    const result = await runShortBreakdownScan({
+      exchange: this.exchange,
+      telegram: this.telegram,
+      whitelist: TOP_CAP_WHITELIST,
+      currentSleeveCount,
+      nowMs: Date.now(),
+    });
+
+    if (!result.ran || result.candidates.length === 0) {
+      if (result.ran) console.log(`[ShortScanner] ${result.reason}`);
+      return;
+    }
+
+    // Open each candidate. Daily-loss / cooldown / max-positions still apply via executeTrade.
+    const balance = parseFloat(account.totalWalletBalance || '0');
+    for (const cand of result.candidates) {
+      // Skip if we already have a position in this symbol (any direction)
+      const hasPos = openPositions.some((p: any) =>
+        p.symbol === cand.symbol && parseFloat(p.positionAmt) !== 0
+      );
+      if (hasPos) {
+        console.log(`[ShortScanner] ${cand.symbol} already has open position, skip`);
+        continue;
+      }
+      const syntheticSignal: SentimentSignal = {
+        asset: cand.asset,
+        sentimentScore: -0.7,
+        confidence: 0.8,
+        magnitude: 0.7,
+        direction: 'negative',
+        source: 'short-scanner',
+        category: 'event',
+        timestamp: Date.now(),
+      };
+      try {
+        await this.executeTrade(
+          cand.symbol,
+          'SHORT',
+          cand.price,
+          cand.stopLoss,
+          0, // SlowTrail: no TP
+          balance,
+          SHORT_SCANNER_STRATEGY,
+          syntheticSignal,
+          1.0, // full size (caps already applied in executeTrade)
+          { rsi: 0, adx: cand.adx, atr: cand.atr, volumeRatio: 1 },
+        );
+      } catch (err) {
+        logError('short_scan_execute_failed', err, { symbol: cand.symbol });
+      }
+    }
   }
 
   /**
