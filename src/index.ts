@@ -402,6 +402,7 @@ app.post('/webhook/telegram/:secret', async (c) => {
               positionSide: direction,
               type: 'MARKET',
               quantity: qty,
+              reduceOnly: true, // critical for Hyperliquid: prevents opening an opposite position
             });
 
             resultMsg += `✅ ${direction} ${target}\n`;
