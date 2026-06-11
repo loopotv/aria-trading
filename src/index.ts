@@ -16,6 +16,7 @@ import { generateReport, formatReportTelegram, formatReportCompact, TradeRecord 
 import { costTracker, loadCosts, flushCosts, formatCostsTelegram } from './wavespeed/client';
 import type { AiBinding } from './wavespeed/workers-ai';
 import { ExperienceDB } from './trading/experience';
+import { backfillNewsOutcomes } from './trading/news-outcome';
 
 type Bindings = {
   EXCHANGE?: string;
@@ -97,6 +98,54 @@ app.get('/account', async (c) => {
 
 // Gate telemetry — aggregate counts per gate over the last N hours (default 24).
 // Used to identify redundant gates and calibrate thresholds (Step 2 prep).
+// Sensor accuracy — THE question: does LLM sentiment predict price?
+// Aggregates was_correct + direction-match per horizon from news-outcome backfill.
+// was_correct: 1=correct, 0=wrong, -1=unprocessable (excluded).
+app.get('/debug/sensor-accuracy', async (c) => {
+  if (!c.env.DB) return c.json({ error: 'DB not configured' }, 500);
+  const days = parseInt(c.req.query('days') || '14');
+
+  const [overall, byConviction, byCategory] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT COUNT(*) as evaluated,
+              ROUND(100.0 * AVG(was_correct), 1) as accuracy_4h_pct,
+              ROUND(100.0 * AVG(CASE WHEN (sentiment_score > 0) = (price_1h_change > 0) THEN 1.0 ELSE 0.0 END), 1) as accuracy_1h_pct,
+              ROUND(100.0 * AVG(CASE WHEN price_24h_change IS NOT NULL AND (sentiment_score > 0) = (price_24h_change > 0) THEN 1.0 WHEN price_24h_change IS NOT NULL THEN 0.0 END), 1) as accuracy_24h_pct,
+              ROUND(AVG(ABS(price_4h_change)), 3) as avg_abs_move_4h_pct
+       FROM news_events
+       WHERE was_correct IN (0, 1)
+         AND processed_at > datetime('now', '-' || ? || ' days')`
+    ).bind(days).all(),
+    c.env.DB.prepare(
+      `SELECT CASE WHEN ABS(sentiment_score) >= 0.8 THEN 'high_0.8+'
+                   WHEN ABS(sentiment_score) >= 0.65 THEN 'mid_0.65-0.8'
+                   ELSE 'low_0.5-0.65' END as conviction,
+              COUNT(*) as n,
+              ROUND(100.0 * AVG(was_correct), 1) as accuracy_4h_pct
+       FROM news_events
+       WHERE was_correct IN (0, 1)
+         AND processed_at > datetime('now', '-' || ? || ' days')
+       GROUP BY conviction ORDER BY conviction`
+    ).bind(days).all(),
+    c.env.DB.prepare(
+      `SELECT category, COUNT(*) as n,
+              ROUND(100.0 * AVG(was_correct), 1) as accuracy_4h_pct
+       FROM news_events
+       WHERE was_correct IN (0, 1)
+         AND processed_at > datetime('now', '-' || ? || ' days')
+       GROUP BY category ORDER BY n DESC`
+    ).bind(days).all(),
+  ]);
+
+  return c.json({
+    window_days: days,
+    note: 'accuracy = % of news where sentiment direction matched price direction. 50% = coin flip (no edge). Verdict thresholds: ≥55% sensor has edge, ≤52% sensor is noise.',
+    overall: overall.results?.[0] ?? null,
+    by_conviction: byConviction.results ?? [],
+    by_category: byCategory.results ?? [],
+  });
+});
+
 app.get('/debug/gate-stats', async (c) => {
   if (!c.env.DB) return c.json({ error: 'DB not configured' }, 500);
   const hours = parseInt(c.req.query('hours') || '24');
@@ -606,6 +655,17 @@ async function runTradingTick(env: Bindings, source: 'internal' | 'external'): P
     await eng.checkSoftOrders();
     await eng.runCycle();
     await eng.rebalanceMarketNeutral();
+
+    // Fase 1 (audit 2026-06-11): news-outcome backfill — populates
+    // price_1h/4h/24h_change + was_correct on classified news so we can
+    // finally measure whether the LLM sentiment predicts price.
+    if (env.DB) {
+      try {
+        await backfillNewsOutcomes(env.DB, eng.getExchange());
+      } catch (e) {
+        console.error(`[Tick/${source}] News-outcome backfill failed:`, (e as Error).message);
+      }
+    }
   } catch (err) {
     console.error(`[Tick/${source}] Error:`, (err as Error).message);
   } finally {
