@@ -20,12 +20,22 @@ export interface RawTextItem {
 const CRYPTOCOMPARE_BASE = 'https://data-api.cryptocompare.com/news/v1';
 
 export async function fetchCryptoCompareNews(
-  limit: number = 50
+  limit: number = 50,
+  apiKey?: string,
 ): Promise<RawTextItem[]> {
-  const url = `${CRYPTOCOMPARE_BASE}/article/list?lang=EN&limit=${limit}`;
+  // 2026-06-15: the public endpoint now returns 401 (key required). When no key
+  // is configured, return [] gracefully instead of throwing — the RSS feeds
+  // carry the load. With a key (free tier at developers.coindesk.com), the
+  // full feed comes back.
+  if (!apiKey) return [];
+
+  const url = `${CRYPTOCOMPARE_BASE}/article/list?lang=EN&limit=${limit}&api_key=${apiKey}`;
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`CryptoCompare error: ${res.status}`);
+  if (!res.ok) {
+    console.warn(`[CryptoCompare] HTTP ${res.status} — skipping (check API key)`);
+    return [];
+  }
 
   const data = (await res.json()) as {
     Data: {
@@ -158,11 +168,20 @@ interface RssFeed {
 }
 
 const RSS_FEEDS: RssFeed[] = [
+  // Tier 1 (original)
   { url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', source: 'coindesk' },
   { url: 'https://cointelegraph.com/rss', source: 'cointelegraph' },
   { url: 'https://www.theblock.co/rss.xml', source: 'theblock' },
   { url: 'https://decrypt.co/feed', source: 'decrypt' },
   { url: 'https://bitcoinmagazine.com/.rss/full/', source: 'bitcoinmagazine' },
+  // Added 2026-06-15 to replace CryptoCompare (its public API now returns 401 —
+  // requires a key). All 6 verified live + regex-parsable before adding.
+  { url: 'https://cryptoslate.com/feed/', source: 'cryptoslate' },
+  { url: 'https://www.newsbtc.com/feed/', source: 'newsbtc' },
+  { url: 'https://cryptobriefing.com/feed/', source: 'cryptobriefing' },
+  { url: 'https://bitcoinist.com/feed/', source: 'bitcoinist' },
+  { url: 'https://ambcrypto.com/feed/', source: 'ambcrypto' },
+  { url: 'https://u.today/rss.php', source: 'utoday' },
 ];
 
 /**

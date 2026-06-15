@@ -54,6 +54,7 @@ export interface EngineConfig {
   dailyLossLimitPct?: number;          // default 2.0
   fundingGateThresholdPct?: number;    // default 50 (used asymmetrically: LONG +X, SHORT -(X-15))
   fundingEmergencyExitPct?: number;    // default 500
+  cryptoCompareApiKey?: string;        // optional — restores CryptoCompare news (now key-gated)
 }
 
 interface SoftOrder {
@@ -224,7 +225,8 @@ export class TradingEngine {
       // 1. Collect events (seenIds only works within same isolate)
       const { newItems: rawItems, fearGreed } = await collectEvents(
         this.seenIds,
-        60 * 60 * 1000 // 1 hour lookback
+        60 * 60 * 1000, // 1 hour lookback
+        this.config.cryptoCompareApiKey,
       );
       this.lastFearGreed = fearGreed.value;
 

@@ -26,14 +26,15 @@ export interface CollectorResult {
  */
 export async function collectEvents(
   seenIds: Set<string>,
-  maxAgeMs: number = 30 * 60 * 1000 // 30 minutes default
+  maxAgeMs: number = 30 * 60 * 1000, // 30 minutes default
+  cryptoCompareApiKey?: string,
 ): Promise<CollectorResult> {
   const now = Date.now();
   const allItems: RawTextItem[] = [];
 
   // Fetch from all sources in parallel
   const [ccNews, reddit, binanceAnn, rss, fearGreed] = await Promise.allSettled([
-    fetchCryptoCompareNews(30),
+    fetchCryptoCompareNews(30, cryptoCompareApiKey),
     fetchAllReddit(),
     fetchBinanceAnnouncements(10),
     fetchAllRss(),

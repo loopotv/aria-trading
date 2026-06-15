@@ -40,6 +40,7 @@ type Bindings = {
   DAILY_LOSS_LIMIT_PCT?: string;          // default 2.0
   FUNDING_GATE_THRESHOLD_PCT?: string;    // default 50
   FUNDING_EMERGENCY_EXIT_PCT?: string;    // default 500
+  CRYPTOCOMPARE_API_KEY?: string;         // optional — restores CryptoCompare news source
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -614,6 +615,7 @@ function getEngine(env: Bindings): TradingEngine {
       dailyLossLimitPct: parsePct(env.DAILY_LOSS_LIMIT_PCT, 2.0),
       fundingGateThresholdPct: parsePct(env.FUNDING_GATE_THRESHOLD_PCT, 50),
       fundingEmergencyExitPct: parsePct(env.FUNDING_EMERGENCY_EXIT_PCT, 500),
+      cryptoCompareApiKey: env.CRYPTOCOMPARE_API_KEY,
     };
 
     if (!env.AI) throw new Error('AI binding required (Workers AI)');
