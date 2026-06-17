@@ -29,7 +29,7 @@ import { logEvent, logError } from '../utils/log';
 
 const NEWS_BATCH_LIMIT = 40;   // max news rows per run
 const MAX_ASSETS_PER_RUN = 8;  // max kline fetches per run (subrequest budget)
-const LOOKBACK_HOURS = 36;     // only process news from this window (skip the 18k backlog)
+const LOOKBACK_HOURS = 40;     // window must outlast the 24h horizon so the 24h fill lands before rows age out
 const HOUR_MS = 3600_000;
 
 interface PendingNewsRow {
@@ -94,8 +94,12 @@ export async function backfillNewsOutcomes(
 ): Promise<BackfillStats> {
   const stats: BackfillStats = { scanned: 0, updated: 0, skippedUnprocessable: 0, assetsFetched: 0 };
 
-  // Pending = at least one horizon elapsed AND its column still NULL.
-  // The 1h column gates the cheapest backfill; 24h completes the row.
+  // Pending = row not yet fully measured (24h horizon still missing) AND not the
+  // -1 unprocessable sentinel. NOTE: we key "still pending" on price_24h_change,
+  // NOT on was_correct. was_correct is set as soon as the 4h outcome is known, but
+  // the 24h column needs the row to be re-visited later (up to 24-36h after
+  // processed_at). Gating on was_correct used to retire rows at the 4h mark, leaving
+  // price_24h_change NULL forever — which starved the 24h-horizon study. (2026-06-17)
   const pending = await db
     .prepare(
       `SELECT id, asset, sentiment_score, processed_at,
@@ -104,7 +108,8 @@ export async function backfillNewsOutcomes(
        WHERE sentiment_score IS NOT NULL
          AND ABS(sentiment_score) >= 0.5
          AND asset IS NOT NULL AND asset != 'MARKET'
-         AND was_correct IS NULL
+         AND price_24h_change IS NULL
+         AND (was_correct IS NULL OR was_correct >= 0)
          AND processed_at > datetime('now', '-${LOOKBACK_HOURS} hours')
          AND processed_at < datetime('now', '-1 hours')
        ORDER BY processed_at ASC
@@ -143,8 +148,8 @@ export async function backfillNewsOutcomes(
 
     let hourCloses: Map<number, number>;
     try {
-      // 48 bars of 1h covers the 36h lookback + 24h horizon for the newest rows.
-      const klines = await exchange.getKlines(symbol, '1h', 48);
+      // 64 bars of 1h covers the 40h lookback + 24h horizon with margin.
+      const klines = await exchange.getKlines(symbol, '1h', 64);
       stats.assetsFetched++;
       if (!klines?.length) throw new Error('empty klines');
       hourCloses = buildHourCloseMap(klines);
@@ -162,19 +167,23 @@ export async function backfillNewsOutcomes(
       }
 
       const elapsed = nowMs - t0;
-      const c1h = r.price_1h_change ?? (elapsed >= 1 * HOUR_MS ? pctChange(hourCloses, t0, 1 * HOUR_MS) : null);
-      const c4h = r.price_4h_change ?? (elapsed >= 4 * HOUR_MS ? pctChange(hourCloses, t0, 4 * HOUR_MS) : null);
-      const c24h = r.price_24h_change ?? (elapsed >= 24 * HOUR_MS ? pctChange(hourCloses, t0, 24 * HOUR_MS) : null);
+      // Compute ONLY columns still missing — a row revisited for its 24h fill must
+      // not re-write its already-known 1h/4h values every tick.
+      const c1h = r.price_1h_change == null && elapsed >= 1 * HOUR_MS ? pctChange(hourCloses, t0, 1 * HOUR_MS) : null;
+      const c4h = r.price_4h_change == null && elapsed >= 4 * HOUR_MS ? pctChange(hourCloses, t0, 4 * HOUR_MS) : null;
+      const c24h = r.price_24h_change == null && elapsed >= 24 * HOUR_MS ? pctChange(hourCloses, t0, 24 * HOUR_MS) : null;
 
-      // was_correct: only once the 4h outcome is known (our trading horizon).
-      // Direction match between sentiment and 4h price change.
+      // was_correct: set once the 4h outcome is known (our trading horizon), using
+      // the newly-computed 4h value or one already stored. Direction match between
+      // sentiment and 4h price change.
+      const eff4h = c4h ?? r.price_4h_change;
       let wasCorrect: number | null = null;
-      if (c4h != null) {
+      if (eff4h != null && r.price_24h_change == null) {
         const sentimentUp = r.sentiment_score > 0;
-        wasCorrect = (sentimentUp === c4h > 0) ? 1 : 0;
+        wasCorrect = (sentimentUp === eff4h > 0) ? 1 : 0;
       }
 
-      // Only write if we have something new.
+      // Only write if we have something new to persist.
       if (c1h == null && c4h == null && c24h == null) continue;
 
       updates.push(

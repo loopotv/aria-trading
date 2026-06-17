@@ -2,7 +2,7 @@
  * Short-breakdown strategy (R3T25S2) — autonomous SHORT sleeve.
  *
  * Validated by the hyper-trader fork as the "short edge" preserved under SlowTrail.
- * Opens SHORT on alts in confirmed downtrend when BTC is also down ≥1%/24h.
+ * Opens SHORT on alts in confirmed downtrend when BTC is also down ≥2.5%/24h.
  * NO news dependency — pure technical setup on 1h klines.
  *
  * Conditions (ALL strict, evaluated on the latest closed 1h bar):
@@ -11,7 +11,7 @@
  *   3. close < EMA20 (price below short-term mean)
  *   4. -DI > +DI (ADX directional indicators agree on bearish)
  *   5. ADX > 22 (trend strength sufficient)
- *   6. BTC 24h return < -1% (macro headwind for the alt sleeve)
+ *   6. BTC 24h return < -2.5% (macro headwind for the alt sleeve)
  *
  * Pure function, no I/O — unit-tested in tests/short-breakdown.test.ts.
  */
@@ -21,7 +21,10 @@ import { calculateEMA, calculateADX, calculateATR } from '../../utils/indicators
 export const R3T25S2 = {
   ATR_PCT_MIN: 0.0115,          // strict >
   ADX_MIN: 22,                   // strict >
-  BTC_RET_24H_MAX: -0.01,        // strict <
+  BTC_RET_24H_MAX: -0.025,       // strict < (tightened -1%→-2.5% on 2026-06-17:
+                                 // sleeve was 14% WR / -$1.77 over 7 trades, shorting
+                                 // shallow -1% dips that bounced. Require a real
+                                 // breakdown so it fires in crashes, not noisy dips.)
   KLINE_LIMIT_REQUIRED: 51,      // ≥51 closed bars needed for EMA50
 } as const;
 

@@ -59,7 +59,7 @@ function flatBars(n = 80) {
 describe("evaluateShortBreakdown — end to end on bars", () => {
   it("eligible on a volatile confirmed downtrend with BTC down", () => {
     const { highs, lows, closes } = downtrendBars();
-    const r = evaluateShortBreakdown(highs, lows, closes, -0.02);
+    const r = evaluateShortBreakdown(highs, lows, closes, -0.03);
     expect(r.failed).toEqual([]);
     expect(r.eligible).toBe(true);
     expect(r.atrPct).toBeGreaterThan(R3T25S2.ATR_PCT_MIN);
@@ -125,22 +125,22 @@ describe("checkShortBreakdownConditions — strict boundaries", () => {
   };
 
   it("all conditions true → no failures", () => {
-    expect(checkShortBreakdownConditions(passing, -0.02)).toEqual([]);
+    expect(checkShortBreakdownConditions(passing, -0.03)).toEqual([]);
   });
 
   it("atrPct exactly at threshold (0.0115) → fails (strict >)", () => {
     expect(
-      checkShortBreakdownConditions({ ...passing, atrPct: R3T25S2.ATR_PCT_MIN }, -0.02),
+      checkShortBreakdownConditions({ ...passing, atrPct: R3T25S2.ATR_PCT_MIN }, -0.03),
     ).toEqual(["atr_pct"]);
   });
 
   it("adx exactly at threshold (22) → fails (strict >)", () => {
     expect(
-      checkShortBreakdownConditions({ ...passing, adx: R3T25S2.ADX_MIN }, -0.02),
+      checkShortBreakdownConditions({ ...passing, adx: R3T25S2.ADX_MIN }, -0.03),
     ).toEqual(["adx_strength"]);
   });
 
-  it("btcRet24h exactly at threshold (-0.01) → fails (strict <)", () => {
+  it("btcRet24h exactly at threshold (-0.025) → fails (strict <)", () => {
     expect(checkShortBreakdownConditions(passing, R3T25S2.BTC_RET_24H_MAX)).toEqual([
       "btc_down",
     ]);
@@ -148,31 +148,31 @@ describe("checkShortBreakdownConditions — strict boundaries", () => {
 
   it("ema20 == ema50 → fails (strict <)", () => {
     expect(
-      checkShortBreakdownConditions({ ...passing, ema20: 98, ema50: 98, close: 94 }, -0.02),
+      checkShortBreakdownConditions({ ...passing, ema20: 98, ema50: 98, close: 94 }, -0.03),
     ).toEqual(["ema_downtrend"]);
   });
 
   it("close == ema20 → fails (strict <)", () => {
     expect(
-      checkShortBreakdownConditions({ ...passing, close: 95 }, -0.02),
+      checkShortBreakdownConditions({ ...passing, close: 95 }, -0.03),
     ).toEqual(["price_below_ema20"]);
   });
 
   it("minusDI == plusDI → fails (strict >)", () => {
     expect(
-      checkShortBreakdownConditions({ ...passing, plusDI: 20, minusDI: 20 }, -0.02),
+      checkShortBreakdownConditions({ ...passing, plusDI: 20, minusDI: 20 }, -0.03),
     ).toEqual(["di_direction"]);
   });
 
   it("each condition fails independently with the right label", () => {
-    expect(checkShortBreakdownConditions({ ...passing, atrPct: 0.001 }, -0.02)).toEqual([
+    expect(checkShortBreakdownConditions({ ...passing, atrPct: 0.001 }, -0.03)).toEqual([
       "atr_pct",
     ]);
-    expect(checkShortBreakdownConditions({ ...passing, adx: 10 }, -0.02)).toEqual([
+    expect(checkShortBreakdownConditions({ ...passing, adx: 10 }, -0.03)).toEqual([
       "adx_strength",
     ]);
     expect(
-      checkShortBreakdownConditions({ ...passing, plusDI: 30 }, -0.02),
+      checkShortBreakdownConditions({ ...passing, plusDI: 30 }, -0.03),
     ).toEqual(["di_direction"]);
     expect(checkShortBreakdownConditions(passing, 0.02)).toEqual(["btc_down"]);
   });

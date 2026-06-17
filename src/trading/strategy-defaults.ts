@@ -14,6 +14,16 @@
  */
 
 export const STRATEGY_DEFAULTS = {
+  // ---- Sensor category gate (G0) ----
+  /**
+   * Categories allowed to trade event-driven. Restricted to 'event' only on
+   * 2026-06-17 after Fase 1 (307-sample sensor study): at the 4h trading horizon
+   * only `event` beats coin-flip (54.1%); `announcement` (41.7%, the bulk),
+   * `sentiment_aggregate` (47.7%) and `rumor` (n=10) are noise or contrarian.
+   * Sharpens the sensor on its one category with measured edge.
+   */
+  allowedCategories: ['event'] as ReadonlyArray<string>,
+
   // ---- Sensor quality gates (G1-G2) ----
   /** Magnitude minimum for any event-driven trade. */
   magnitudeMin: 0.6,                  // hyper-trader: 0.6 (was 0.5)

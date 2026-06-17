@@ -5,7 +5,7 @@
  * conditions (see strategies/short-breakdown.ts) and opens up to MAX_SHORT_SLEEVE
  * positions, ranked by atrPct (highest volatility first — the strategy's edge).
  *
- * No news/LLM dependency. When BTC is falling >1%/24h, this sleeve naturally
+ * No news/LLM dependency. When BTC is falling >2.5%/24h, this sleeve naturally
  * hedges the long event-driven book; otherwise it stays silent.
  *
  * Adapted from hyper-trader for our smaller account / simpler infrastructure:

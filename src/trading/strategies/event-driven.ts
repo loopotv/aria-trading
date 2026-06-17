@@ -97,6 +97,15 @@ export function evaluateEventSignal(
   const failCheck = (gateId: string, value: number | null, threshold: number | null, reason: string) =>
     checks.push({ gateId, direction: dirRef.current, passed: false, value, threshold, reason });
 
+  // --- Gate 0: Category allowlist (2026-06-17, Fase 1 verdict) ---
+  // Only `event` cleared coin-flip at the 4h horizon (54.1%); announcement /
+  // sentiment_aggregate / rumor are noise. Reject the rest up-front.
+  if (!STRATEGY_DEFAULTS.allowedCategories.includes(signal.category)) {
+    failCheck('category', null, null, `category_${signal.category}_not_allowed`);
+    return reject(symbol, `Category '${signal.category}' not traded (only ${STRATEGY_DEFAULTS.allowedCategories.join(',')})`, indicators, checks);
+  }
+  passCheck('category', null, null);
+
   // --- Gate 1: Magnitude threshold (Step 1, 2026-05-27: 0.5 → 0.6) ---
   const magMin = STRATEGY_DEFAULTS.magnitudeMin;
   if (signal.magnitude < magMin) {
