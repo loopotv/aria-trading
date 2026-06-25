@@ -25,7 +25,7 @@ import { quickIdentifyAsset } from './asset-resolver';
 import { buildPriceContext } from './price-context';
 import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
-import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS } from './exits/slowtrail';
+import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS, isCatastrophicLoss } from './exits/slowtrail';
 import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY } from './short-scanner';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
@@ -55,6 +55,13 @@ export interface EngineConfig {
   fundingGateThresholdPct?: number;    // default 50 (used asymmetrically: LONG +X, SHORT -(X-15))
   fundingEmergencyExitPct?: number;    // default 500
   cryptoCompareApiKey?: string;        // optional — restores CryptoCompare news (now key-gated)
+  /**
+   * Catastrophic stop multiple: force-close a position when its adverse excursion
+   * reaches this multiple of the intended SL distance. Backstop for when the real
+   * exchange stop fails to place or slips on a fast move (e.g. TIA -1.12 vs -0.44
+   * expected, 2026-06-25). default 1.5.
+   */
+  catastrophicSlMult?: number;         // default 1.5
 }
 
 interface SoftOrder {
@@ -1868,19 +1875,41 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       let shouldClose = false;
       let reason = '';
 
-      // STEP 1.3 — Emergency funding exit (highest priority).
+      // ---- CATASTROPHIC STOP CIRCUIT BREAKER (2026-06-25, highest priority) ----
+      // The real exchange stop should fire at 1.0× the SL distance. If price has run
+      // to catastrophicSlMult× that distance against us, the exchange stop clearly
+      // failed to place or slipped (TIA -1.12 vs -0.44 expected). Force-close at
+      // market NOW instead of waiting for the trail/SlowTrail logic — this is the
+      // hard cap on a single trade's loss.
+      const catMult = this.config.catastrophicSlMult ?? 1.5;
+      if (isCatastrophicLoss(order.direction, order.entryPrice, currentPrice, order.stopLoss, catMult)) {
+        shouldClose = true;
+        const slDist = Math.abs(order.entryPrice - order.stopLoss);
+        reason = `🚨 Catastrophic stop (≥ ${catMult}× SL dist ${slDist.toFixed(4)} — exchange stop failed/slipped)`;
+        await this.telegram.sendMessage(
+          `🚨 <b>CATASTROPHIC STOP — ${order.symbol} ${order.direction}</b>\n\n` +
+          `Adverse move reached ${catMult}× the intended SL (${slDist.toFixed(4)}).\n` +
+          `The exchange stop did not protect. Force-closing at market.\n` +
+          `Entry <code>$${order.entryPrice.toFixed(4)}</code> → Mark <code>$${currentPrice.toFixed(4)}</code>\n` +
+          `PnL: <code>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</code>`
+        );
+      }
+
+      // STEP 1.3 — Emergency funding exit.
       // Strips asset prefix from symbol: 'BTCUSDT' -> 'BTC' for Hyperliquid funding lookup.
       // Note: this MUST run even when daily_loss HALT is active — it's an exit, not entry.
       const assetForFunding = order.symbol.endsWith('USDT')
         ? order.symbol.slice(0, -4)
         : order.symbol;
-      const emergencyCheck = await checkEmergencyFundingExit(
-        this.exchange,
-        assetForFunding,
-        order.direction,
-        this.config.fundingEmergencyExitPct ?? 500,
-        this.experience?.getDb(),
-      );
+      const emergencyCheck = shouldClose
+        ? { exit: false as boolean, fundingAnnualPct: undefined as number | undefined }
+        : await checkEmergencyFundingExit(
+            this.exchange,
+            assetForFunding,
+            order.direction,
+            this.config.fundingEmergencyExitPct ?? 500,
+            this.experience?.getDb(),
+          );
       if (emergencyCheck.exit) {
         shouldClose = true;
         reason = `🚨 EMERGENCY funding (${emergencyCheck.fundingAnnualPct?.toFixed(0)}% APR > threshold)`;

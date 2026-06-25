@@ -23,6 +23,33 @@ export const SLOWTRAIL_ARM_MS = 6 * 60 * 60 * 1000; // trail arms after 6h held
 export const SLOWTRAIL_GIVEBACK = 0.02; // give back 2% of the peak excursion
 export const SLOWTRAIL_DEADLINE_MS = 48 * 60 * 60 * 1000; // hard close at 48h
 
+/** Default catastrophic-stop multiple of the intended SL distance. */
+export const CATASTROPHIC_SL_MULT = 1.5;
+
+/**
+ * Catastrophic-loss circuit breaker (pure). The real exchange stop should fire at
+ * 1.0× the SL distance; if price has run to `mult`× that distance against us, the
+ * stop failed to place or slipped (e.g. TIA -1.12 vs -0.44 expected, 2026-06-25).
+ * Returns true → force-close at market immediately.
+ *
+ * Adverse excursion is signed per direction: for LONG, loss when price < entry;
+ * for SHORT, loss when price > entry. Returns false if the SL distance is zero
+ * (nothing to scale against).
+ */
+export function isCatastrophicLoss(
+  direction: 'LONG' | 'SHORT',
+  entryPrice: number,
+  currentPrice: number,
+  stopLoss: number,
+  mult: number = CATASTROPHIC_SL_MULT,
+): boolean {
+  const slDist = Math.abs(entryPrice - stopLoss);
+  if (!(slDist > 0)) return false;
+  const sign = direction === 'LONG' ? 1 : -1;
+  const adverse = sign * (entryPrice - currentPrice); // >0 = losing
+  return adverse >= mult * slDist;
+}
+
 export interface SlowTrailState {
   direction: 'LONG' | 'SHORT';
   entryPrice: number;

@@ -4,6 +4,7 @@ import {
   SLOWTRAIL_ARM_MS,
   SLOWTRAIL_GIVEBACK,
   SLOWTRAIL_DEADLINE_MS,
+  isCatastrophicLoss,
   type SlowTrailState,
 } from "../src/trading/exits/slowtrail";
 
@@ -154,5 +155,35 @@ describe("evaluateSlowTrail — post-deploy recovery semantics", () => {
       T0 + 10 * H,
     );
     expect(d.action).toBe("none");
+  });
+});
+
+describe('isCatastrophicLoss — circuit breaker', () => {
+  // TIA SHORT real case: entry 0.3441, SL 0.3542 (slDist 0.0101). 1.5× = 0.01515.
+  // Breaker should fire at price >= 0.3441 + 0.01515 = 0.35925.
+  it('SHORT: fires when adverse >= 1.5x SL distance', () => {
+    expect(isCatastrophicLoss('SHORT', 0.3441, 0.3599, 0.3542)).toBe(true);
+    expect(isCatastrophicLoss('SHORT', 0.3441, 0.3700, 0.3542)).toBe(true); // the actual -1.12 fill
+  });
+  it('SHORT: does NOT fire below the multiple', () => {
+    expect(isCatastrophicLoss('SHORT', 0.3441, 0.3550, 0.3542)).toBe(false); // just past SL, not yet 1.5x
+    expect(isCatastrophicLoss('SHORT', 0.3441, 0.3400, 0.3542)).toBe(false); // in profit
+  });
+  it('LONG: mirror — fires when price drops 1.5x SL distance below entry', () => {
+    // entry 100, SL 98 (slDist 2). 1.5x = 3 → fires at price <= 97.
+    expect(isCatastrophicLoss('LONG', 100, 97, 98)).toBe(true);
+    expect(isCatastrophicLoss('LONG', 100, 96.9, 98)).toBe(true);
+    expect(isCatastrophicLoss('LONG', 100, 97.5, 98)).toBe(false);
+    expect(isCatastrophicLoss('LONG', 100, 101, 98)).toBe(false); // in profit
+  });
+  it('exactly at the multiple → fires (>=)', () => {
+    expect(isCatastrophicLoss('LONG', 100, 97, 98, 1.5)).toBe(true);
+  });
+  it('custom multiple respected', () => {
+    expect(isCatastrophicLoss('LONG', 100, 96, 98, 2.0)).toBe(true);  // 2x = 4 → fires at <=96
+    expect(isCatastrophicLoss('LONG', 100, 96.5, 98, 2.0)).toBe(false);
+  });
+  it('zero SL distance → never fires (guard)', () => {
+    expect(isCatastrophicLoss('SHORT', 100, 200, 100)).toBe(false);
   });
 });
