@@ -88,6 +88,21 @@ export class ExperienceDB {
     return row?.id || 0;
   }
 
+  /**
+   * Is there an OPEN trade for this symbol right now? (any direction)
+   * Persistent cross-isolate guard: used by the short-scanner to avoid opening a
+   * duplicate position when two cron invocations run concurrently — the in-memory
+   * softOrders map and the exchange snapshot are both isolate-local and stale, so
+   * we check D1 (the shared source of truth) immediately before opening. (2026-06-25)
+   */
+  async hasOpenTrade(symbol: string): Promise<boolean> {
+    const row = await this.db
+      .prepare(`SELECT 1 AS x FROM trades WHERE symbol = ? AND status = 'OPEN' LIMIT 1`)
+      .bind(symbol)
+      .first<{ x: number }>();
+    return row != null;
+  }
+
   async recordTradeClose(
     symbol: string,
     direction: string,

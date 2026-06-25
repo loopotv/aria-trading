@@ -1246,6 +1246,21 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       if (order?.strategy === SHORT_SCANNER_STRATEGY) currentSleeveCount++;
     }
 
+    // Persistent sleeve count from D1. The softOrders-based count above is
+    // isolate-local: on a cold/concurrent isolate it reads 0 and would bypass the
+    // MAX_SHORT_SLEEVE cap. Take the max so the cap holds across invocations. (2026-06-25)
+    if (this.experience) {
+      try {
+        const openD1 = await this.experience.getOpenTrades();
+        const sleeveD1 = openD1.filter(
+          (t) => t.strategy === SHORT_SCANNER_STRATEGY && t.direction === 'SHORT'
+        ).length;
+        currentSleeveCount = Math.max(currentSleeveCount, sleeveD1);
+      } catch (e) {
+        console.warn(`[ShortScanner] D1 sleeve count failed: ${(e as Error).message?.slice(0, 80)}`);
+      }
+    }
+
     const result = await runShortBreakdownScan({
       exchange: this.exchange,
       telegram: this.telegram,
@@ -1262,12 +1277,21 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
     // Open each candidate. Daily-loss / cooldown / max-positions still apply via executeTrade.
     const balance = parseFloat(account.totalWalletBalance || '0');
     for (const cand of result.candidates) {
-      // Skip if we already have a position in this symbol (any direction)
+      // Skip if we already have a position in this symbol (any direction).
+      // Exchange snapshot first (isolate-local, may be stale)...
       const hasPos = openPositions.some((p: any) =>
         p.symbol === cand.symbol && parseFloat(p.positionAmt) !== 0
       );
       if (hasPos) {
         console.log(`[ShortScanner] ${cand.symbol} already has open position, skip`);
+        continue;
+      }
+      // ...then a FRESH D1 check immediately before opening. This is the
+      // cross-isolate guard: a concurrent cron invocation that already opened this
+      // symbol will have written an OPEN row, so we skip instead of doubling the
+      // position (the TIA 14:00+14:01 double-open bug). (2026-06-25)
+      if (this.experience && (await this.experience.hasOpenTrade(cand.symbol))) {
+        console.log(`[ShortScanner] ${cand.symbol} already OPEN in D1 (concurrent guard), skip`);
         continue;
       }
       const syntheticSignal: SentimentSignal = {
