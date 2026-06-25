@@ -1595,32 +1595,37 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
    * Recovers soft orders from D1 if in-memory map is empty (after deploy/restart).
    */
   async checkSoftOrders(): Promise<void> {
+    // Fetch D1 OPEN trades ONCE — used for two purposes:
+    //   1. Recover the in-memory softOrders map after an isolate restart.
+    //   2. Dedup orphan adoption: a position already tracked by an OPEN row in D1
+    //      must NEVER be re-adopted into a second row (the cause of the orphan
+    //      double-counting bug — fixed 2026-06-25).
+    const d1OpenTrades = this.experience ? await this.experience.getOpenTrades() : [];
+    const d1OpenByKey = new Map<string, (typeof d1OpenTrades)[number]>();
+    for (const t of d1OpenTrades) d1OpenByKey.set(`${t.symbol}:${t.direction}`, t);
+
+    const rebuildSoftOrder = (t: (typeof d1OpenTrades)[number]) => {
+      const openedAt = new Date(t.opened_at).getTime();
+      softOrders.set(`${t.symbol}:${t.direction}`, {
+        symbol: t.symbol,
+        direction: t.direction as 'LONG' | 'SHORT',
+        stopLoss: t.stop_loss as number,
+        takeProfit: t.take_profit ?? 0,
+        quantity: t.quantity,
+        entryPrice: t.price,
+        strategy: t.strategy,
+        openedAt,
+        // SlowTrail deadline: cap at openedAt + 48h (may already be in the past for recovered trades)
+        timeoutAt: openedAt + SLOWTRAIL_DEADLINE_MS,
+        bestClose: t.price, // best unknown after restart; reset to entry, will re-converge naturally
+      });
+    };
+
     // Recover soft orders from D1 if in-memory map is empty (lost after deploy/restart)
-    if (softOrders.size === 0 && this.experience) {
-      const openTrades = await this.experience.getOpenTrades();
-      for (const t of openTrades) {
-        // SlowTrail: take_profit=0 is valid sentinel; only require stop_loss.
-        if (t.stop_loss) {
-          const key = `${t.symbol}:${t.direction}`;
-          const openedAt = new Date(t.opened_at).getTime();
-          softOrders.set(key, {
-            symbol: t.symbol,
-            direction: t.direction as 'LONG' | 'SHORT',
-            stopLoss: t.stop_loss,
-            takeProfit: t.take_profit ?? 0,
-            quantity: t.quantity,
-            entryPrice: t.price,
-            strategy: t.strategy,
-            openedAt,
-            // SlowTrail deadline: cap at openedAt + 48h (may already be in the past for recovered trades)
-            timeoutAt: openedAt + SLOWTRAIL_DEADLINE_MS,
-            bestClose: t.price, // best unknown after restart; reset to entry, will re-converge naturally
-          });
-        }
-      }
-      if (openTrades.length > 0) {
-        console.log(`[SoftSL/TP] Recovered ${softOrders.size} orders from D1`);
-      }
+    if (softOrders.size === 0 && d1OpenTrades.length > 0) {
+      // SlowTrail: take_profit=0 is valid sentinel; only require stop_loss.
+      for (const t of d1OpenTrades) if (t.stop_loss) rebuildSoftOrder(t);
+      console.log(`[SoftSL/TP] Recovered ${softOrders.size} orders from D1`);
     }
 
     const account = await this.getAccount();
@@ -1640,6 +1645,17 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       const direction: 'LONG' | 'SHORT' = amt > 0 ? 'LONG' : 'SHORT';
       const key = `${pos.symbol}:${direction}`;
       if (softOrders.has(key)) continue;
+
+      // DEDUP: if this position already has an OPEN row in D1, it is NOT an orphan —
+      // it just isn't in this isolate's in-memory map. Rebuild the softOrder from the
+      // existing row and skip adoption. Without this, a warm isolate (map non-empty,
+      // so the recovery above was skipped) re-adopts tracked positions every tick,
+      // creating duplicate OPEN rows that all close to the same PnL. (fixed 2026-06-25)
+      const tracked = d1OpenByKey.get(key);
+      if (tracked) {
+        if (tracked.stop_loss) rebuildSoftOrder(tracked);
+        continue;
+      }
 
       try {
         // Fetch klines to compute a sensible ATR for SL/TP placement.
