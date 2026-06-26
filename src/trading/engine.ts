@@ -27,6 +27,7 @@ import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
 import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS, isCatastrophicLoss } from './exits/slowtrail';
 import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY } from './short-scanner';
+import { logShortScanSignals } from './short-scan-outcome';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
 import { logEvent, logError } from '../utils/log';
@@ -1283,6 +1284,7 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
 
     // Open each candidate. Daily-loss / cooldown / max-positions still apply via executeTrade.
     const balance = parseFloat(account.totalWalletBalance || '0');
+    const openedSymbols = new Set<string>();
     for (const cand of result.candidates) {
       // Skip if we already have a position in this symbol (any direction).
       // Exchange snapshot first (isolate-local, may be stale)...
@@ -1324,8 +1326,25 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           1.0, // full size (caps already applied in executeTrade)
           { rsi: 0, adx: cand.adx, atr: cand.atr, volumeRatio: 1 },
         );
+        openedSymbols.add(cand.symbol);
       } catch (err) {
         logError('short_scan_execute_failed', err, { symbol: cand.symbol });
+      }
+    }
+
+    // Part B (2026-06-26): log EVERY eligible candidate (opened or not) for the
+    // short-scan signal-outcome study. A backfill fills the forward price outcome.
+    if (this.experience && result.allEligible?.length) {
+      try {
+        await logShortScanSignals(
+          this.experience.getDb(),
+          result.allEligible,
+          result.btcRet24h ?? 0,
+          openedSymbols,
+          Date.now(),
+        );
+      } catch (e) {
+        console.warn(`[ShortScanner] signal log failed: ${(e as Error).message?.slice(0, 80)}`);
       }
     }
   }

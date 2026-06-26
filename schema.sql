@@ -107,6 +107,30 @@ CREATE TABLE IF NOT EXISTS news_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Short-scan signal-outcome study (Part B, 2026-06-26).
+-- Logs EVERY eligible short-breakdown candidate (opened or not) at scan time, then a
+-- backfill records the forward price outcome. Decouples ENTRY-signal quality from exit
+-- and execution, and enables per-condition attribution (ATR%, ADX, BTC regime, rank).
+CREATE TABLE IF NOT EXISTS short_scan_signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  signal_ts INTEGER NOT NULL,           -- ms epoch of the scan
+  entry_price REAL NOT NULL,
+  atr_pct REAL,                          -- decimal (0.02 = 2%)
+  adx REAL,
+  btc_ret_24h REAL,                      -- decimal at scan time
+  rank INTEGER,                          -- rank by atr_pct among eligible (1 = top pick)
+  eligible_count INTEGER,                -- how many were eligible this scan
+  opened INTEGER NOT NULL DEFAULT 0,     -- 1 if we actually opened it
+  price_4h_change REAL,                  -- % change entry->+4h (short wants <0)
+  price_24h_change REAL,                 -- % change entry->+24h
+  mfe_24h REAL,                          -- max favorable excursion (down) %, 0-24h
+  mae_24h REAL,                          -- max adverse excursion (up) %, 0-24h
+  was_correct INTEGER,                   -- 1 if price_4h_change<0; 0 else; -1 unprocessable
+  scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shortscan_pending ON short_scan_signals (was_correct, signal_ts);
+
 -- Daily performance snapshots
 CREATE TABLE IF NOT EXISTS daily_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

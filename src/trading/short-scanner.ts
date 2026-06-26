@@ -49,7 +49,9 @@ export interface ShortScanCandidate {
 export interface ShortScanResult {
   ran: boolean;
   reason: string;
-  candidates: ShortScanCandidate[];
+  candidates: ShortScanCandidate[];      // the subset we will open (ranked, sliced to free slots)
+  allEligible?: ShortScanCandidate[];    // ALL eligible this scan (ranked) — for the Part B signal study
+  btcRet24h?: number;                    // BTC 24h return at scan time (decimal)
 }
 
 /**
@@ -179,7 +181,7 @@ export async function runShortBreakdownScan(args: {
     toOpen.map(c => `• <code>${c.symbol}</code> ATR=${(c.atrPct * 100).toFixed(2)}% ADX=${c.adx.toFixed(0)}`).join('\n')
   );
 
-  return { ran: true, reason: 'scan_completed', candidates: toOpen };
+  return { ran: true, reason: 'scan_completed', candidates: toOpen, allEligible: candidates, btcRet24h };
 }
 
 /** For testing or admin: reset the hour cache. */

@@ -17,6 +17,7 @@ import { costTracker, loadCosts, flushCosts, formatCostsTelegram } from './waves
 import type { AiBinding } from './wavespeed/workers-ai';
 import { ExperienceDB } from './trading/experience';
 import { backfillNewsOutcomes } from './trading/news-outcome';
+import { backfillShortScanOutcomes } from './trading/short-scan-outcome';
 
 type Bindings = {
   EXCHANGE?: string;
@@ -144,6 +145,56 @@ app.get('/debug/sensor-accuracy', async (c) => {
     overall: overall.results?.[0] ?? null,
     by_conviction: byConviction.results ?? [],
     by_category: byCategory.results ?? [],
+  });
+});
+
+// Part B (2026-06-26): short-scan signal-outcome study.
+// hit-rate = % of eligible candidates where price actually fell (short was right),
+// measured on ALL eligible (opened or not), with per-condition attribution.
+app.get('/debug/shortscan-accuracy', async (c) => {
+  if (!c.env.DB) return c.json({ error: 'DB not configured' }, 500);
+  const days = parseInt(c.req.query('days') || '21');
+  const sinceMs = Date.now() - days * 86400 * 1000;
+
+  const overallQ = `SELECT COUNT(*) as evaluated,
+       ROUND(100.0 * AVG(was_correct), 1) as hit_rate_4h_pct,
+       ROUND(100.0 * AVG(CASE WHEN price_24h_change IS NOT NULL AND price_24h_change < 0 THEN 1.0 WHEN price_24h_change IS NOT NULL THEN 0.0 END), 1) as hit_rate_24h_pct,
+       ROUND(AVG(mfe_24h), 2) as avg_mfe_pct,
+       ROUND(AVG(mae_24h), 2) as avg_mae_pct,
+       ROUND(AVG(ABS(price_4h_change)), 2) as avg_abs_move_4h_pct
+     FROM short_scan_signals WHERE was_correct IN (0,1) AND signal_ts > ?`;
+
+  const [overall, byAtr, byAdx, byBtc, bySelection] = await Promise.all([
+    c.env.DB.prepare(overallQ).bind(sinceMs).all(),
+    c.env.DB.prepare(
+      `SELECT CASE WHEN atr_pct >= 0.025 THEN 'high_2.5%+' WHEN atr_pct >= 0.018 THEN 'mid_1.8-2.5%' ELSE 'low_<1.8%' END as atr_bucket,
+              COUNT(*) as n, ROUND(100.0*AVG(was_correct),1) as hit_4h_pct, ROUND(AVG(mfe_24h),2) as avg_mfe
+       FROM short_scan_signals WHERE was_correct IN (0,1) AND signal_ts > ? GROUP BY atr_bucket ORDER BY atr_bucket`
+    ).bind(sinceMs).all(),
+    c.env.DB.prepare(
+      `SELECT CASE WHEN adx >= 40 THEN 'strong_40+' WHEN adx >= 30 THEN 'mid_30-40' ELSE 'weak_22-30' END as adx_bucket,
+              COUNT(*) as n, ROUND(100.0*AVG(was_correct),1) as hit_4h_pct, ROUND(AVG(mfe_24h),2) as avg_mfe
+       FROM short_scan_signals WHERE was_correct IN (0,1) AND signal_ts > ? GROUP BY adx_bucket ORDER BY adx_bucket`
+    ).bind(sinceMs).all(),
+    c.env.DB.prepare(
+      `SELECT CASE WHEN btc_ret_24h < -0.05 THEN 'btc_<-5%' WHEN btc_ret_24h < -0.035 THEN 'btc_-3.5to-5%' ELSE 'btc_-2.5to-3.5%' END as btc_bucket,
+              COUNT(*) as n, ROUND(100.0*AVG(was_correct),1) as hit_4h_pct, ROUND(AVG(mfe_24h),2) as avg_mfe
+       FROM short_scan_signals WHERE was_correct IN (0,1) AND signal_ts > ? GROUP BY btc_bucket ORDER BY btc_bucket`
+    ).bind(sinceMs).all(),
+    c.env.DB.prepare(
+      `SELECT opened, COUNT(*) as n, ROUND(100.0*AVG(was_correct),1) as hit_4h_pct, ROUND(AVG(mfe_24h),2) as avg_mfe, ROUND(AVG(mae_24h),2) as avg_mae
+       FROM short_scan_signals WHERE was_correct IN (0,1) AND signal_ts > ? GROUP BY opened ORDER BY opened DESC`
+    ).bind(sinceMs).all(),
+  ]);
+
+  return c.json({
+    window_days: days,
+    note: 'hit_rate = % of eligible short signals where price fell (short was right). 50% = coin flip. Measured on ALL eligible (opened or not). MFE/MAE in % over 24h.',
+    overall: overall.results?.[0] ?? null,
+    by_atr_pct: byAtr.results ?? [],
+    by_adx: byAdx.results ?? [],
+    by_btc_regime: byBtc.results ?? [],
+    by_selection_opened_vs_not: bySelection.results ?? [],
   });
 });
 
@@ -666,6 +717,12 @@ async function runTradingTick(env: Bindings, source: 'internal' | 'external'): P
         await backfillNewsOutcomes(env.DB, eng.getExchange());
       } catch (e) {
         console.error(`[Tick/${source}] News-outcome backfill failed:`, (e as Error).message);
+      }
+      // Part B (2026-06-26): short-scan signal-outcome backfill.
+      try {
+        await backfillShortScanOutcomes(env.DB, eng.getExchange());
+      } catch (e) {
+        console.error(`[Tick/${source}] Short-scan backfill failed:`, (e as Error).message);
       }
     }
   } catch (err) {
