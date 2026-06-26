@@ -27,6 +27,7 @@ import { logEvent, logError } from '../utils/log';
 
 export const MAX_SHORT_SLEEVE = 2;
 export const SHORT_SCANNER_STRATEGY = 'short-breakdown';
+export const TP_ATR_MULT = 2.5; // SHORT take-profit distance in ATRs (exit backtest, 2026-06-26)
 const HOUR_MS = 3600_000;
 const KLINE_LIMIT = 60;
 
@@ -42,6 +43,7 @@ export interface ShortScanCandidate {
   atr: number;
   adx: number;
   stopLoss: number;
+  takeProfit: number;
 }
 
 export interface ShortScanResult {
@@ -126,6 +128,12 @@ export async function runShortBreakdownScan(args: {
       const atr = result.atrPct * price;
       // SHORT SL: 1.3×ATR above entry (matches event-driven slMultiplier)
       const stopLoss = price + atr * 1.3;
+      // SHORT TP: TP_ATR_MULT×ATR below entry. Added 2026-06-26 after the exit
+      // backtest on 43 trades: the entry signal has a ~4.5% avg favorable excursion
+      // (MFE) that the slow trail kept giving back. A real resting TP order captures
+      // it intrabar on the favorable side (no soft-SL poll slippage). 2.5×ATR ≈ the
+      // average MFE; best simulated sum-return of the policies tested.
+      const takeProfit = price - atr * TP_ATR_MULT;
 
       candidates.push({
         symbol,
@@ -135,6 +143,7 @@ export async function runShortBreakdownScan(args: {
         atr,
         adx: result.indicators.adx,
         stopLoss,
+        takeProfit,
       });
     } catch (err) {
       logError('short_scan_symbol_failed', err, { symbol });

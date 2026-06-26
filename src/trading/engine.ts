@@ -1317,7 +1317,7 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           'SHORT',
           cand.price,
           cand.stopLoss,
-          0, // SlowTrail: no TP
+          cand.takeProfit, // real TP @ 2.5×ATR — captures MFE intrabar (exit backtest 2026-06-26)
           balance,
           SHORT_SCANNER_STRATEGY,
           syntheticSignal,
