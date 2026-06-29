@@ -28,6 +28,12 @@ import { logEvent, logError } from '../utils/log';
 export const MAX_SHORT_SLEEVE = 2;
 export const SHORT_SCANNER_STRATEGY = 'short-breakdown';
 export const TP_ATR_MULT = 2.5; // SHORT take-profit distance in ATRs (exit backtest, 2026-06-26)
+// Per-symbol re-entry cooldown (2026-06-29). The scanner is meant to run hourly, but
+// its isolate-local throttle lets it re-scan every tick; without a persistent guard a
+// position that just closed gets re-opened seconds later on the same unchanged 1h setup
+// — pure fee churn (WLD closed -0.06 at 03:15, re-opened 19s later). Mirror the hourly
+// cadence per symbol, regardless of win/loss.
+export const SHORT_REENTRY_COOLDOWN_MS = 60 * 60 * 1000;
 const HOUR_MS = 3600_000;
 const KLINE_LIMIT = 60;
 

@@ -26,7 +26,7 @@ import { buildPriceContext } from './price-context';
 import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
 import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS, isCatastrophicLoss } from './exits/slowtrail';
-import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY } from './short-scanner';
+import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY, SHORT_REENTRY_COOLDOWN_MS } from './short-scanner';
 import { logShortScanSignals } from './short-scan-outcome';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
@@ -1302,6 +1302,20 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       if (this.experience && (await this.experience.hasOpenTrade(cand.symbol))) {
         console.log(`[ShortScanner] ${cand.symbol} already OPEN in D1 (concurrent guard), skip`);
         continue;
+      }
+      // Re-entry cooldown: don't re-short a symbol that just closed (win OR loss) on
+      // the same unchanged 1h setup — that's the fee churn. Persistent via D1, so it
+      // holds across the isolate-local hourly throttle. (2026-06-29)
+      if (this.experience) {
+        const last = await this.experience.getLastTrade(cand.symbol);
+        if (last?.closed_at) {
+          const sinceClose = Date.now() - new Date(last.closed_at).getTime();
+          if (sinceClose < SHORT_REENTRY_COOLDOWN_MS) {
+            const minsLeft = Math.ceil((SHORT_REENTRY_COOLDOWN_MS - sinceClose) / 60000);
+            console.log(`[ShortScanner] ${cand.symbol} re-entry cooldown (${minsLeft}min left), skip`);
+            continue;
+          }
+        }
       }
       const syntheticSignal: SentimentSignal = {
         asset: cand.asset,
