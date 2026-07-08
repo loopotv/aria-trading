@@ -26,7 +26,7 @@ import { buildPriceContext } from './price-context';
 import { checkMacroRegime } from './macro-regime';
 import { checkTrendReversal } from './trend-reversal';
 import { evaluateSlowTrail, type SlowTrailState, SLOWTRAIL_DEADLINE_MS, isCatastrophicLoss } from './exits/slowtrail';
-import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY, SHORT_REENTRY_COOLDOWN_MS } from './short-scanner';
+import { runShortBreakdownScan, SHORT_SCANNER_STRATEGY, SHORT_REENTRY_COOLDOWN_MS, SHORT_SCANNER_LIVE } from './short-scanner';
 import { logShortScanSignals } from './short-scan-outcome';
 import { checkFundingGate, checkEmergencyFundingExit } from './funding-gates';
 import { calculateRSI, calculateADX, calculateEMA, calculateMACD, calculateATR } from '../utils/indicators';
@@ -1285,7 +1285,10 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
     // Open each candidate. Daily-loss / cooldown / max-positions still apply via executeTrade.
     const balance = parseFloat(account.totalWalletBalance || '0');
     const openedSymbols = new Set<string>();
-    for (const cand of result.candidates) {
+    // SIGNAL-ONLY MODE: skip real opens entirely; Part B logging below still runs
+    // (openedSymbols stays empty → rows logged with opened=0). See SHORT_SCANNER_LIVE
+    // in short-scanner.ts for the pre-committed re-enable criterion.
+    for (const cand of SHORT_SCANNER_LIVE ? result.candidates : []) {
       // Skip if we already have a position in this symbol (any direction).
       // Exchange snapshot first (isolate-local, may be stale)...
       const hasPos = openPositions.some((p: any) =>

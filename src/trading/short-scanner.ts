@@ -27,6 +27,16 @@ import { logEvent, logError } from '../utils/log';
 
 export const MAX_SHORT_SLEEVE = 2;
 export const SHORT_SCANNER_STRATEGY = 'short-breakdown';
+/**
+ * SIGNAL-ONLY MODE (2026-07-08). When false, the scanner runs and logs every
+ * eligible candidate to short_scan_signals (Part B study) but does NOT open real
+ * positions. Decision after -$4.68 all-time on this sleeve (62% of total drawdown),
+ * -$0.75 in the first fully-fixed week, and a 3.3% 4h hit-rate in Part B's first
+ * window — the entry signal is unproven at best.
+ * RE-ENABLE CRITERION (pre-committed): flip to true only when /debug/shortscan-accuracy
+ * shows 4h hit-rate ≥ 50% across ≥ 3 DISTINCT breakdown windows (different days).
+ */
+export const SHORT_SCANNER_LIVE = false;
 export const TP_ATR_MULT = 2.5; // SHORT take-profit distance in ATRs (exit backtest, 2026-06-26)
 // Per-symbol re-entry cooldown (2026-06-29). The scanner is meant to run hourly, but
 // its isolate-local throttle lets it re-scan every tick; without a persistent guard a
@@ -180,7 +190,7 @@ export async function runShortBreakdownScan(args: {
 
   // Telegram digest (no individual opens here — caller orchestrates executeTrade)
   await telegram.sendMessage(
-    `🔻 <b>Short-Breakdown Scan</b>\n\n` +
+    `🔻 <b>Short-Breakdown Scan${SHORT_SCANNER_LIVE ? '' : ' — 📋 SIGNAL-ONLY (no trades)'}</b>\n\n` +
     `BTC 24h: <code>${(btcRet24h * 100).toFixed(2)}%</code>\n` +
     `Eligible: ${candidates.length} | Slots: ${slotsAvailable}\n` +
     `Top picks (by ATR%):\n` +
