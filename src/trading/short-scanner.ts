@@ -35,6 +35,21 @@ export const SHORT_SCANNER_STRATEGY = 'short-breakdown';
  * window — the entry signal is unproven at best.
  * RE-ENABLE CRITERION (pre-committed): flip to true only when /debug/shortscan-accuracy
  * shows 4h hit-rate ≥ 50% across ≥ 3 DISTINCT breakdown windows (different days).
+ *
+ * VERDICT on the original config (2026-07-20, 765 signals / 6 windows): 30.5% 4h
+ * hit-rate → FAILED. Stays signal-only.
+ *
+ * PRE-REGISTERED HYPOTHESIS H1 (2026-07-20): candidates with atr_pct ≥ 0.018 have
+ * a real edge. Evidence at registration (NOT usable for the verdict — it generated
+ * the hypothesis): 61.9% aggregate (n=118), ≥70% in 3/5 windows, 0-10% in 2/5.
+ * VALIDATION RULE: on breakdown windows AFTER 2026-07-20 only — the atr_pct ≥ 0.018
+ * bucket must show ≥50% 4h hit-rate in at least 2 of the next 3 windows AND ≥55%
+ * aggregate across them. If confirmed → re-enable live ONLY for atr_pct ≥ 0.018
+ * candidates (ATR_PCT_MIN stays 0.0115 for LOGGING — the low bucket is the control
+ * group). If refuted → sleeve retires.
+ * Check: SELECT date(scanned_at), COUNT(*), ROUND(100*AVG(was_correct),1) FROM
+ * short_scan_signals WHERE was_correct IN (0,1) AND atr_pct>=0.018 AND
+ * scanned_at>'2026-07-20' GROUP BY 1;
  */
 export const SHORT_SCANNER_LIVE = false;
 export const TP_ATR_MULT = 2.5; // SHORT take-profit distance in ATRs (exit backtest, 2026-06-26)
