@@ -212,7 +212,8 @@ CREATE TABLE IF NOT EXISTS daily_risk_state (
   realized_pnl REAL NOT NULL DEFAULT 0,  -- cumulative realized PnL since equity_start
   halted INTEGER NOT NULL DEFAULT 0,     -- 0 = trading allowed, 1 = halt new entries
   initialized_at TEXT NOT NULL DEFAULT (datetime('now')),
-  halted_at TEXT
+  halted_at TEXT,
+  pending_breach_at TEXT            -- anti-false-halt: 1st breach read awaiting 2nd-read confirmation
 );
 
 -- Per-gate decision log. Captures BOTH passed and rejected checks so we can

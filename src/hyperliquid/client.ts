@@ -473,6 +473,37 @@ export class HyperliquidClient implements IExchange {
     return result;
   }
 
+  /**
+   * Untriggered trigger orders (SL/TP) resting on the book for a symbol.
+   * Uses frontendOpenOrders — the only info endpoint that exposes isTrigger —
+   * so the stop-resting audit (Fix 2b) can verify a protective stop exists.
+   */
+  async getTriggerOrders(symbol: string): Promise<Array<{
+    orderId: string;
+    side: 'BUY' | 'SELL';
+    triggerPx: number;
+    reduceOnly: boolean;
+  }>> {
+    const coin = this.toHlSymbol(symbol);
+    const orders = await this.infoPost<Array<{
+      coin: string;
+      oid: number;
+      side: string;         // 'B' | 'A'
+      isTrigger?: boolean;
+      triggerPx?: string;
+      reduceOnly?: boolean;
+    }>>({ type: 'frontendOpenOrders', user: this.userAddress });
+
+    return (orders || [])
+      .filter((o) => o.coin === coin && o.isTrigger === true)
+      .map((o) => ({
+        orderId: String(o.oid),
+        side: o.side === 'B' ? 'BUY' as const : 'SELL' as const,
+        triggerPx: parseFloat(o.triggerPx || '0'),
+        reduceOnly: o.reduceOnly === true,
+      }));
+  }
+
   async getUserTrades(symbol?: string, limit?: number): Promise<any[]> {
     const fills = await this.infoPost<HlFill[]>({
       type: 'userFills',

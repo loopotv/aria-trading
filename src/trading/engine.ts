@@ -37,6 +37,9 @@ import {
   setHalted,
   isOverDailyLossLimit,
   addRealizedPnl,
+  confirmBreach,
+  setPendingBreach,
+  clearPendingBreach,
 } from './daily-risk';
 import { costTracker, extractJson } from '../wavespeed/client';
 import type { AiBinding } from '../wavespeed/workers-ai';
@@ -81,6 +84,8 @@ interface SoftOrder {
   originalQty?: number;
   /** SlowTrail (added 2026-06-10): best favorable close reached since open. */
   bestClose?: number;
+  /** Stop-resting audit (Fix 2b, 2026-07-20): alert/verify once per state, not per tick. */
+  stopAuditState?: 'verified' | 'missing_alerted';
 }
 
 /**
@@ -517,6 +522,22 @@ export class TradingEngine {
 
       const { halted, lossPct } = isOverDailyLossLimit(state, equity, limitPct);
       if (halted) {
+        // ANTI-FALSE-HALT GUARD (2026-07-20): a single bad equity read (07-15 and
+        // 07-18: API returned ~-4.7% dips with zero positions) must not halt the
+        // whole day. First breach read → block THIS tick only and mark pending;
+        // a second breach read within the confirm window → sticky day halt.
+        if (!confirmBreach(state.pendingBreachAt, Date.now())) {
+          await setPendingBreach(db);
+          await logGate(db, {
+            gateId: 'daily_loss',
+            passed: false,
+            value: lossPct,
+            threshold: -limitPct,
+            reason: 'breach_pending_confirmation (1st read, no sticky halt)',
+          });
+          return { allowed: false, lossPct };
+        }
+
         await setHalted(db);
         logEvent('daily_loss_limit_breached', {
           equity_start: state.equityStart,
@@ -528,7 +549,8 @@ export class TradingEngine {
           `🛑 <b>DAILY LOSS HALT</b>\n\n` +
           `Equity start: $${state.equityStart.toFixed(2)}\n` +
           `Equity now: $${equity.toFixed(2)}\n` +
-          `Loss: ${lossPct.toFixed(2)}% (limit -${limitPct}%)\n\n` +
+          `Loss: ${lossPct.toFixed(2)}% (limit -${limitPct}%)\n` +
+          `Confirmed by 2 consecutive readings.\n\n` +
           `New entries blocked until 00:00 UTC. Existing positions unaffected.`
         );
         await logGate(db, {
@@ -536,10 +558,13 @@ export class TradingEngine {
           passed: false,
           value: lossPct,
           threshold: -limitPct,
-          reason: 'DAILY_LOSS_HALT (newly triggered)',
+          reason: 'DAILY_LOSS_HALT (confirmed 2 reads)',
         });
         return { allowed: false, lossPct };
       }
+
+      // Clean reading: clear any stale pending breach (it was a glitch).
+      if (state.pendingBreachAt) await clearPendingBreach(db);
 
       await logGate(db, {
         gateId: 'daily_loss',
@@ -1566,7 +1591,7 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       let tpPlaced = false;
 
       try {
-        await this.exchange.newAlgoOrder({
+        const slRes = await this.exchange.newAlgoOrder({
           symbol,
           side: (direction === 'LONG' ? 'SELL' : 'BUY') as 'BUY' | 'SELL',
           positionSide: direction as 'LONG' | 'SHORT',
@@ -1574,8 +1599,20 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
           triggerPrice: roundedSL,
           quantity,
         });
-        slPlaced = true;
-        console.log(`[Trade] SL placed @ ${roundedSL}`);
+        // Fix 2b: a no-throw call is NOT proof the stop rests — require the
+        // exchange ack (resting oid). Without it the position would run on the
+        // soft-SL poll alone (the TIA -1.12 slippage path).
+        slPlaced = Boolean((slRes as { orderId?: number | string } | null)?.orderId);
+        if (slPlaced) {
+          console.log(`[Trade] SL placed @ ${roundedSL}`);
+        } else {
+          console.warn(`[Trade] Algo SL NOT resting (no orderId ack) for ${symbol}`);
+          await this.telegram.sendMessage(
+            `⚠️ <b>SL not resting — ${symbol} ${direction}</b>\n` +
+            `Order call succeeded but the exchange returned no resting order id. ` +
+            `Position protected only by soft-SL (5-min poll) + circuit breaker.`
+          );
+        }
       } catch (slErr) {
         const slErrMsg = (slErr as Error).message?.slice(0, 100);
         console.warn(`[Trade] Algo SL failed: ${slErrMsg}`);
@@ -1910,6 +1947,63 @@ Respond ONLY with a JSON object: {"execute": true/false, "reasoning": "1-2 sente
       const pnl = parseFloat(pos.unrealizedProfit);
       let shouldClose = false;
       let reason = '';
+
+      // ---- STOP-RESTING AUDIT (Fix 2b, 2026-07-20) ----
+      // Verify a protective stop actually RESTS on the exchange for this position:
+      // a trigger order on the closing side, on the LOSS side of entry (TP triggers
+      // sit on the profit side and don't count). Alerts once per state transition,
+      // never blocks the exit loop. This closes the diagnostic gap behind TIA
+      // (-1.12 vs -0.44): the breaker caps damage, this tells us WHY it was needed.
+      if (this.exchange.getTriggerOrders) {
+        try {
+          const trigs = await this.exchange.getTriggerOrders(order.symbol);
+          const closeSide = order.direction === 'LONG' ? 'SELL' : 'BUY';
+          const hasRestingStop = trigs.some((t) =>
+            t.side === closeSide &&
+            t.triggerPx > 0 &&
+            (order.direction === 'LONG'
+              ? t.triggerPx < order.entryPrice
+              : t.triggerPx > order.entryPrice)
+          );
+          if (!hasRestingStop && order.stopAuditState !== 'missing_alerted') {
+            order.stopAuditState = 'missing_alerted';
+            const dbAudit = this.experience?.getDb();
+            if (dbAudit) {
+              await logGate(dbAudit, {
+                gateId: 'stop_resting',
+                asset: order.symbol.replace(/USDT$/, ''),
+                direction: order.direction,
+                passed: false,
+                value: null,
+                threshold: null,
+                reason: 'no_resting_stop_on_exchange',
+              });
+            }
+            await this.telegram.sendMessage(
+              `🚨 <b>NO RESTING STOP — ${order.symbol} ${order.direction}</b>\n\n` +
+              `The exchange has no protective stop for this position.\n` +
+              `Currently protected only by soft-SL (5-min poll) + circuit breaker.\n` +
+              `Entry <code>$${order.entryPrice.toFixed(4)}</code> | soft-SL <code>$${order.stopLoss.toFixed(4)}</code>`
+            );
+          } else if (hasRestingStop && order.stopAuditState !== 'verified') {
+            order.stopAuditState = 'verified';
+            const dbAudit = this.experience?.getDb();
+            if (dbAudit) {
+              await logGate(dbAudit, {
+                gateId: 'stop_resting',
+                asset: order.symbol.replace(/USDT$/, ''),
+                direction: order.direction,
+                passed: true,
+                value: null,
+                threshold: null,
+                reason: 'stop_verified_resting',
+              });
+            }
+          }
+        } catch {
+          /* audit is diagnostic-only — never break the exit loop */
+        }
+      }
 
       // ---- CATASTROPHIC STOP CIRCUIT BREAKER (2026-06-25, highest priority) ----
       // The real exchange stop should fire at 1.0× the SL distance. If price has run

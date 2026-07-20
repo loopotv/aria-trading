@@ -93,6 +93,17 @@ export interface IExchange {
   getTicker24hr(symbol: string): Promise<Ticker24hr>;
   /** Returns hourly funding rate as decimal (e.g. 0.0000125 = 0.00125%/h), or null if unknown/unsupported. */
   getFundingRate?(asset: string): Promise<number | null>;
+  /**
+   * Optional: untriggered trigger orders (SL/TP) resting on the exchange for a
+   * symbol. Used by the stop-resting audit (Fix 2b, 2026-07-20) to verify a real
+   * protective stop exists after placement.
+   */
+  getTriggerOrders?(symbol: string): Promise<Array<{
+    orderId: string;
+    side: 'BUY' | 'SELL';
+    triggerPx: number;
+    reduceOnly: boolean;
+  }>>;
 
   // --- Account ---
   getAccountInfo(): Promise<AccountInfo>;
