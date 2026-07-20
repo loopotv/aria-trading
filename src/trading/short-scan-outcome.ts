@@ -25,6 +25,44 @@ const MAX_ASSETS_PER_RUN = 8;
 const LOOKBACK_HOURS = 40; // must outlast the 24h horizon so the 24h fill lands before rows age out
 
 /**
+ * PRE-REGISTERED HYPOTHESIS H2 (2026-07-20) — macro-news window classifier.
+ * Retro analysis of the first 6 breakdown windows: the 3 windows where shorts had
+ * follow-through (06-30, 07-08, 07-13) coincided with US-politics/geopolitics news
+ * storms + negative aggregate sentiment (07-08: 202 politics news, avg sent -0.055);
+ * the V-bounce windows (06-26, 07-17) had low policy volume but liquidation-chatter
+ * spikes (capitulation flush → bounce). H2: policy-driven breakdowns follow through,
+ * flush-driven breakdowns mean-revert. The three news_* columns log these features
+ * per scan so H2 can be validated on FUTURE windows only, alongside H1 (atr ≥ 1.8%).
+ */
+interface NewsContext24h {
+  politics: number;
+  liquidation: number;
+  avgSent: number | null;
+}
+
+async function fetchNewsContext24h(db: D1Database): Promise<NewsContext24h> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN lower(title) LIKE '%tariff%' OR lower(title) LIKE '%trump%'
+                 OR lower(title) LIKE '%white house%' OR lower(title) LIKE '%congress%'
+                 OR lower(title) LIKE '%senate%' OR lower(title) LIKE '%nato%'
+                 OR lower(title) LIKE '%election%' THEN 1 ELSE 0 END) AS politics,
+           SUM(CASE WHEN lower(title) LIKE '%liquidat%' OR lower(title) LIKE '%crash%'
+                 OR lower(title) LIKE '%selloff%' OR lower(title) LIKE '%plunge%' THEN 1 ELSE 0 END) AS liq,
+           ROUND(AVG(sentiment_score), 3) AS avg_sent
+         FROM news_events
+         WHERE processed_at > datetime('now', '-24 hours')`
+      )
+      .first<{ politics: number | null; liq: number | null; avg_sent: number | null }>();
+    return { politics: row?.politics ?? 0, liquidation: row?.liq ?? 0, avgSent: row?.avg_sent ?? null };
+  } catch {
+    return { politics: 0, liquidation: 0, avgSent: null }; // measurement-only: never block the scan
+  }
+}
+
+/**
  * Persist every eligible candidate from one scan. `allEligible` is ranked by ATR%
  * DESC (rank 1 = top pick). `openedSymbols` flags which ones we actually opened.
  */
@@ -36,12 +74,14 @@ export async function logShortScanSignals(
   signalTs: number,
 ): Promise<void> {
   if (!allEligible.length) return;
+  const ctx = await fetchNewsContext24h(db);
   const stmts = allEligible.map((c, i) =>
     db
       .prepare(
         `INSERT INTO short_scan_signals
-          (symbol, signal_ts, entry_price, atr_pct, adx, btc_ret_24h, rank, eligible_count, opened)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (symbol, signal_ts, entry_price, atr_pct, adx, btc_ret_24h, rank, eligible_count, opened,
+           news_politics_24h, news_liq_24h, news_sent_24h)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         c.symbol,
@@ -53,6 +93,9 @@ export async function logShortScanSignals(
         i + 1,
         allEligible.length,
         openedSymbols.has(c.symbol) ? 1 : 0,
+        ctx.politics,
+        ctx.liquidation,
+        ctx.avgSent,
       )
   );
   try {

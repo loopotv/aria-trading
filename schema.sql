@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS short_scan_signals (
   mfe_24h REAL,                          -- max favorable excursion (down) %, 0-24h
   mae_24h REAL,                          -- max adverse excursion (up) %, 0-24h
   was_correct INTEGER,                   -- 1 if price_4h_change<0; 0 else; -1 unprocessable
+  news_politics_24h INTEGER,             -- H2: US-politics/geopolitics news count, prior 24h
+  news_liq_24h INTEGER,                  -- H2: liquidation/crash-chatter news count, prior 24h
+  news_sent_24h REAL,                    -- H2: avg sentiment of all news, prior 24h
   scanned_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_shortscan_pending ON short_scan_signals (was_correct, signal_ts);
